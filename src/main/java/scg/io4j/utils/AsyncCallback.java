@@ -1,28 +1,34 @@
 package scg.io4j.utils;
 
-import java.util.concurrent.atomic.AtomicBoolean;
+import io.atlassian.fugue.Either;
 
-public interface Callback<R> {
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
+
+import static io.atlassian.fugue.Either.left;
+import static io.atlassian.fugue.Either.right;
+
+public interface AsyncCallback<R> {
 
     void success(R result);
     void failure(Throwable cause);
 
-    static <R> Callback<R> once(Callback<R> delegate) {
-        return new Callback<>() {
+    static <R> AsyncCallback<R> wrap(Consumer<Either<Throwable, R>> f) {
+        return new AsyncCallback<>() {
 
             final AtomicBoolean done = new AtomicBoolean(false);
 
             @Override
             public void success(R result) {
                 if (done.compareAndSet(false, true)) {
-                    delegate.success(result);
+                    f.accept(right(result));
                 }
             }
 
             @Override
             public void failure(Throwable cause) {
                 if (done.compareAndSet(false, true)) {
-                    delegate.failure(cause);
+                    f.accept(left(cause));
                 }
             }
         };

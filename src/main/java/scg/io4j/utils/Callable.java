@@ -5,6 +5,8 @@ import static io.atlassian.fugue.Either.right;
 
 import io.atlassian.fugue.Either;
 
+import java.util.function.Consumer;
+
 @FunctionalInterface
 public interface Callable<R> extends Attempt<R> {
 

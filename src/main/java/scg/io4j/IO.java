@@ -3,7 +3,7 @@ package scg.io4j;
 import io.atlassian.fugue.*;
 import scg.io4j.utils.Action;
 import scg.io4j.utils.Callable;
-import scg.io4j.utils.Callback;
+import scg.io4j.utils.AsyncCallback;
 
 import java.io.PrintStream;
 import java.util.concurrent.*;
@@ -23,8 +23,8 @@ import static io.atlassian.fugue.Suppliers.ofInstance;
 
 import static scg.io4j.Fiber.wrap;
 import static scg.io4j.ProgressStatus.*;
+import static scg.io4j.utils.AsyncCallback.wrap;
 import static scg.io4j.utils.Callable.always;
-import static scg.io4j.utils.Callback.once;
 
 @FunctionalInterface
 public interface IO<R> extends Runnable {
@@ -302,27 +302,13 @@ public interface IO<R> extends Runnable {
 
     }
 
-    static <R> IO<R> async(Consumer<Callback<R>> scope) {
+    static <R> IO<R> async(Consumer<AsyncCallback<R>> scope) {
         return callback -> {
-
-            Callback<R> acceptor = new Callback<>() {
-                @Override
-                public void success(R result) {
-                    callback.accept(right(result));
-                }
-
-                @Override
-                public void failure(Throwable cause) {
-                    callback.accept(left(cause));
-                }
-            };
-
             try {
-                scope.accept(once(acceptor));
+                scope.accept(wrap(callback));
             } catch (Throwable cause) {
                 callback.accept(left(cause));
             }
-
         };
     }
 
