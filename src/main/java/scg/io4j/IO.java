@@ -48,12 +48,8 @@ public interface IO<R> extends Runnable {
         this.run(printStackTrace(out));
     }
 
-    default void run(ProgressCheck bar) {
-
-        bar.update(RUNNING);
-
-        this.run(handleStatus(bar::update));
-
+    default void run(ProgressCheck progress) {
+        unit(() -> progress.update(RUNNING)).then(this).run(handleStatus(progress::update));
     }
 
     default void run(CountDownLatch successor) {
