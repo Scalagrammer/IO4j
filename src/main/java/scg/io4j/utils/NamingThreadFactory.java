@@ -6,7 +6,7 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicLong;
 
 @RequiredArgsConstructor
-public class NamingThreadFactory implements ThreadFactory {
+public final class NamingThreadFactory implements ThreadFactory {
 
     private final AtomicLong counter = new AtomicLong(0L);
 
@@ -27,7 +27,7 @@ public class NamingThreadFactory implements ThreadFactory {
     }
 
     private String nextThreadName() {
-        return namePattern.replaceAll("%d", String.valueOf(counter.incrementAndGet()));
+        return String.format(namePattern, counter.incrementAndGet());
     }
 
 }

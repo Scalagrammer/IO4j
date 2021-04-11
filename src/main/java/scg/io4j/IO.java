@@ -1,66 +1,58 @@
 package scg.io4j;
 
 import io.atlassian.fugue.*;
-import scg.io4j.utils.Action;
+import lombok.val;
+import scg.io4j.utils.*;
 import scg.io4j.utils.Callable;
-import scg.io4j.utils.AsyncCallback;
 
 import java.io.PrintStream;
-import java.util.concurrent.*;
-import java.util.function.*;
-import java.util.stream.Stream;
-import java.util.NoSuchElementException;
-import java.util.concurrent.atomic.AtomicBoolean;
 
-import static io.atlassian.fugue.Option.*;
+import java.util.function.*;
+import java.util.concurrent.*;
+import java.util.stream.Stream;
+
+import static java.util.Objects.nonNull;
+import static java.util.concurrent.ForkJoinPool.commonPool;
 import static java.util.stream.Stream.*;
-import static io.atlassian.fugue.Pair.pair;
+
 import static io.atlassian.fugue.Unit.VALUE;
 import static io.atlassian.fugue.Either.left;
 import static io.atlassian.fugue.Either.right;
-import static io.atlassian.fugue.Functions.constant;
 import static io.atlassian.fugue.Suppliers.ofInstance;
 
 import static scg.io4j.Fiber.wrap;
-import static scg.io4j.ProgressStatus.*;
+import static scg.io4j.OptionT.optionT;
 import static scg.io4j.utils.AsyncCallback.wrap;
-import static scg.io4j.utils.Callable.always;
+import static scg.io4j.utils.TFunction.constantT;
+import static scg.io4j.utils.TSupplier.ofInstanceT;
 
 @FunctionalInterface
 public interface IO<R> extends Runnable {
 
-    void run(Consumer<Either<Throwable, R>> callback);
+    void run(TConsumer<Either<Throwable, R>> callback);
 
     @Override
     default void run() {
         this.run(System.out);
     }
 
-    default <T> T to(Function<IO<R>, T> f) {
-        return f.apply(this);
-    }
-
-    default void run(Handler h) {
-        this.run(handle(h));
-    }
-
     default void run(PrintStream out) {
         this.run(printStackTrace(out));
-    }
-
-    default void run(ProgressCheck progress) {
-        unit(() -> progress.update(RUNNING)).then(this).run(handleStatus(progress::update));
     }
 
     default void run(CountDownLatch successor) {
         this.run(countDown(successor));
     }
 
+    default <RR> RR to(TFunction<IO<R>, RR> f) {
+        return f.apply(this);
+    }
+
     default CompletableFuture<R> toFuture(Executor executor) {
 
         CompletableFuture<R> promise = new CompletableFuture<>();
 
-        Consumer<Either<Throwable, R>> callback = attempt -> {
+        TConsumer<Either<Throwable, R>> callback = attempt -> {
             if (attempt.isRight()) {
                 (attempt.right()).forEach(promise::complete);
             } else {
@@ -68,36 +60,91 @@ public interface IO<R> extends Runnable {
             }
         };
 
-        this.shift(executor).run(callback); // start async
+        executor.execute(() -> run(callback));
 
         return promise;
-
     }
 
-    default IO<Either<Throwable, R>> attempt() {
-        return callback -> run(attempt -> callback.accept(right(attempt)));
+    default IO<String> show(Show<R> f) {
+        return this.map(f);
+    }
+
+    default IO<R> shift() {
+        return this.shift(commonPool());
     }
 
     default IO<R> shift(Executor executor) {
         return callback -> executor.execute(() -> run(callback));
     }
 
-    default <RR> IO<RR> then(IO<RR> next) {
-        return this.flatMap(constant(next));
+    default IO<Fiber<R>> fiber() {
+        return this.fiber(commonPool());
     }
 
-    default <RR> IO<R> tap(IO<RR> next) {
-        return this.flatTap(constant(next));
+    default IO<Fiber<R>> fiber(Executor executor) {
+        return delay(() -> wrap(toFuture(executor)));
     }
 
-    default IO<R> filter(Predicate<R> p) {
-        return this.flatMap(r -> p.test(r) ? raise(NoSuchElementException::new) : pure(r));
+    default IO<Either<Throwable, R>> attempt() {
+        return callback -> run(attempt -> callback.accept(right(attempt)));
     }
 
-    default IO<R> recoverWith(Class<? extends Throwable> causeType, IO<R> alternative) {
+    @SuppressWarnings("StatementWithEmptyBody")
+    default <RR> IO<RR> tailRecM(TFunction<R, IO<Either<R, RR>>> loop) {
+
+        class IOStack {
+
+            private IO<Either<R, RR>> top = flatMap(loop);
+
+            void push(IO<Either<R, RR>> e) { this.top = e; }
+
+            boolean popAndRun(TConsumer<Either<Throwable, Either<R, RR>>> callback) {
+
+                val local = this.top; // get current
+
+                this.top = (null); // "reset" state ("pop")
+
+                val defined = nonNull(local);
+
+                if (defined) local.run(callback); // run callback if exists
+
+                return defined;
+
+            }
+        }
+
+        TConsumer<AsyncCallback<RR>> scope = callback -> {
+
+            IOStack stack = new IOStack();
+
+            TConsumer<Either<R, RR>> onSuccess = result -> {
+                if (result.isRight()) {
+                    (result.right()).forEach(callback::success);
+                } else {
+                    (result.swap()).map(loop).forEach(stack::push);
+                }
+            };
+
+            TConsumer<Either<Throwable, Either<R, RR>>> iteration = attempt -> {
+                if (attempt.isRight()) {
+                    (attempt.right()).forEach(onSuccess);
+                } else {
+                    (attempt.left()).forEach(callback::failure);
+                }
+            };
+
+            while (stack.popAndRun(iteration));
+
+        };
+
+        return IO.async(scope);
+
+    }
+
+    default IO<R> matchError(Class<? extends Throwable> causeType, Supplier<R> result) {
         return callback -> {
 
-            Consumer<Either<Throwable, R>> catcher = attempt -> {
+            TConsumer<Either<Throwable, R>> catcher = attempt -> {
 
                 if (attempt.isRight()) {
                     callback.accept(attempt);
@@ -105,8 +152,8 @@ public interface IO<R> extends Runnable {
                 }
 
                 Consumer<Throwable> match = cause -> {
-                    if (causeType.isAssignableFrom(cause.getClass())) {
-                        alternative.run(callback);
+                    if (causeType.isInstance(cause)) {
+                        callback.accept(right(result.get()));
                     } else {
                         callback.accept(attempt);
                     }
@@ -117,61 +164,140 @@ public interface IO<R> extends Runnable {
             };
 
             this.run(catcher);
-
         };
     }
 
-    default IO<R> filterNot(Predicate<R> p) {
-        return this.filter(p.negate());
+    default IO<R> matchErrorWith(Class<? extends Throwable> causeType, IO<R> result) {
+        return callback -> {
+
+            TConsumer<Either<Throwable, R>> catcher = attempt -> {
+
+                if (attempt.isRight()) {
+                    callback.accept(attempt);
+                    return;
+                }
+
+                Consumer<Throwable> match = cause -> {
+                    if (causeType.isInstance(cause)) {
+                        result.run(callback);
+                    } else {
+                        callback.accept(attempt);
+                    }
+                };
+
+                (attempt.swap()).forEach(match);
+
+            };
+
+            this.run(catcher);
+        };
     }
 
-    default <RR> IO<RR> fold(Supplier<RR> zero, BiFunction<RR, R, RR> f) {
-        return this.map(r -> f.apply(zero.get(), r));
+    default IO<R> matchError(Class<? extends Throwable> causeType, R result) {
+        return this.matchError(causeType, ofInstance(result));
     }
 
-    default IO<R> foldMonoid(Monoid<R> monoid) {
-        return this.map(r -> monoid.append(monoid.zero(), r));
+    default IO<R> recover(TFunction<Throwable, R> f) {
+        return callback -> {
+
+            Consumer<Throwable> onFailure = cause -> {
+                callback.accept(right(f.apply(cause)));
+            };
+
+            TConsumer<Either<Throwable, R>> catcher = attempt -> {
+                if (attempt.isRight()) {
+                    callback.accept(attempt);
+                } else {
+                    (attempt.left()).forEach(onFailure);
+                }
+            };
+
+            this.run(catcher);
+        };
     }
 
-    default IO<Unit> thenIf(Predicate<R> p, IO<Unit> proceed) {
-        return this.flatMap(r -> p.test(r) ? proceed : unit());
+    default IO<R> recoverWith(Function<Throwable, IO<R>> f) {
+        return callback -> {
+
+            Consumer<Throwable> onFailure = cause -> {
+                f.apply(cause).run(callback);
+            };
+
+            TConsumer<Either<Throwable, R>> catcher = attempt -> {
+                if (attempt.isRight()) {
+                    callback.accept(attempt);
+                } else {
+                    (attempt.left()).forEach(onFailure);
+                }
+            };
+
+            this.run(catcher);
+        };
     }
 
-    default IO<Fiber<R>> fiber(Executor executor) {
-        return delay(() -> wrap(toFuture(executor)));
+    default IO<Unit> thenIf(Predicate<R> p, IO<Unit> then) {
+        return this.flatMap(r -> p.test(r) ? then : unit());
     }
 
-    default <RR> IO<Pair<R, RR>> productR(IO<RR> right) {
-        return this.flatMap(r -> right.map(rr -> pair(r, rr)));
+    default IO<Unit> thenIfAsync(TFunction<R, IO<Boolean>> p, IO<Unit> then) {
+        return this.bind(p, (cond -> cond ? then : unit()));
     }
 
-    default <RR> IO<Pair<RR, R>> productL(IO<RR> right) {
-        return this.flatMap(r -> right.map(rr -> pair(rr, r)));
+    default <RR> IO<RR> productR(IO<RR> right) {
+        return this.flatMap(constantT(right));
     }
 
-    default <RR> IO<Pair<R, RR>> mproduct(Function<R, IO<RR>> f) {
-        return this.flatMap(r -> f.apply(r).map(rr -> pair(r, rr)));
+    default <RR> IO<R> productL(IO<RR> right) {
+        return right.flatMap(constantT(this));
     }
 
-    default <RR> IO<Pair<R, RR>> fproduct(Function<R, RR> f) {
-        return this.map(r -> pair(r, f.apply(r)));
+    default <RR> IO<Product2<R, RR>> tupleR(RR right) {
+        return this.map(r -> Product2.apply(r, right));
     }
 
-    default <RR> IO<RR> map(Function<R, RR> f) {
+    default <RR> IO<Product2<RR, R>> tupleL(RR right) {
+        return this.map(r -> Product2.apply(right, r));
+    }
+
+    default <RR> IO<Product2<R, RR>> mproduct(Function<R, IO<RR>> f) {
+        return this.flatMap(r -> f.apply(r).map(rr -> Product2.apply(r, rr)));
+    }
+
+    default <RR> IO<Product2<RR, R>> mproductLeft(Function<R, IO<RR>> f) {
+        return this.flatMap(r -> f.apply(r).map(rr -> Product2.apply(rr, r)));
+    }
+
+    default <RR> IO<Product2<R, RR>> fproduct(Function<R, RR> f) {
+        return this.map(r -> Product2.apply(r, f.apply(r)));
+    }
+
+    default <RR> IO<Product2<RR, R>> fproductLeft(TFunction<R, RR> f) {
+        return this.map(r -> Product2.apply(f.apply(r), r));
+    }
+
+    default <RR> IO<RR> map(TFunction<R, RR> f) {
         return callback -> run(attempt -> callback.accept(attempt.map(f)));
     }
 
-    default <RR> IO<RR> flatMap(Function<R, IO<RR>> f) {
+    default <RR> IO<RR> cast(Class<RR> type) {
+        return this.map(type::cast);
+    }
+
+    default <RR> IO<RR> flatMap(TFunction<R, IO<RR>> f) {
         return callback -> {
 
-            Consumer<Either<Throwable, R>> g = attempt -> {
+            TConsumer<Either<Throwable, R>> g = attempt -> {
+                if (attempt.isRight()) {
 
-                Either<Throwable, IO<RR>> mapped = attempt.map(f);
+                    val e = attempt.map(f);
 
-                if (mapped.isRight()) {
-                    (mapped.right()).forEach(thunk -> thunk.run(callback));
-                } else {
-                    (mapped.left()).forEach(cause -> callback.accept(left(cause)));
+                    if (e.isRight()) {
+                        (e.right()).forEach(thunk -> thunk.run(callback));
+                    } else {
+                        (e.left()).forEach(cause -> callback.accept(left(cause)));
+                    }
+                } else { // fail-fast
+                    (attempt.left()).forEach(cause -> callback.accept(left(cause)));
                 }
             };
 
@@ -180,48 +306,75 @@ public interface IO<R> extends Runnable {
         };
     }
 
-    default <A, B> IO<B> bind(Function<R, IO<A>> f1, Function<A, IO<B>> f2) {
+    default <A, B> IO<B> bind(TFunction<R, IO<A>> f1, TFunction<A, IO<B>> f2) {
         return this.flatMap(f1).flatMap(f2);
     }
 
-    default <A, B, C> IO<C> bind(Function<R, IO<A>> f1, Function<A, IO<B>> f2, Function<B, IO<C>> f3) {
+    default <A, B, C> IO<C> bind(TFunction<R, IO<A>> f1, TFunction<A, IO<B>> f2, TFunction<B, IO<C>> f3) {
         return this.flatMap(f1).flatMap(f2).flatMap(f3);
     }
 
-    default <A, B, C, D> IO<D> bind(Function<R, IO<A>> f1, Function<A, IO<B>> f2, Function<B, IO<C>> f3, Function<C, IO<D>> f4) {
+    default <A, B, C, D> IO<D> bind(TFunction<R, IO<A>> f1, TFunction<A, IO<B>> f2, TFunction<B, IO<C>> f3, TFunction<C, IO<D>> f4) {
         return this.flatMap(f1).flatMap(f2).flatMap(f3).flatMap(f4);
     }
 
-    default <A, B, C, D, E> IO<E> bind(Function<R, IO<A>> f1, Function<A, IO<B>> f2, Function<B, IO<C>> f3, Function<C, IO<D>> f4, Function<D, IO<E>> f5) {
+    default <A, B, C, D, E> IO<E> bind(TFunction<R, IO<A>> f1, TFunction<A, IO<B>> f2, TFunction<B, IO<C>> f3, TFunction<C, IO<D>> f4, TFunction<D, IO<E>> f5) {
         return this.flatMap(f1).flatMap(f2).flatMap(f3).flatMap(f4).flatMap(f5);
     }
 
     default <RR> IO<RR> as(RR value) {
-        return this.as(always(value));
+        return this.map(constantT(value));
     }
 
     default <RR> IO<RR> as(Callable<RR> callback) {
-        return this.then(delay(callback));
+        return this.productR(delay(callback));
     }
 
-    default <RR> IO<R> flatTap(Function<R, IO<RR>> f) {
+    default <RR> IO<R> flatTap(TFunction<R, IO<RR>> f) {
         return this.flatMap(arg -> f.apply(arg).as(arg));
     }
 
-    static <A, R> Function<A, IO<R>> by(Function<A, R> f) {
-        return f.andThen(IO::pure);
+    // constructors
+
+    static <L, R> IO<Option<Product2<L, R>>> tupled(IO<Option<L>> lf, IO<Option<R>> rf) {
+        return optionT(lf).flatMap(l -> optionT(rf).map(r -> Product2.apply(l, r))).toIO();
     }
 
-    static <A, R> Function<IO<A>, IO<R>> lift(Function<A, R> f) {
+    @SafeVarargs
+    static <R> Sequence<R> sequence(IO<R>... ops) {
+        return sequence(of(ops));
+    }
+
+    static <R> Sequence<R> sequence(Stream<IO<R>> value) {
+        return new SequenceImpl<>(value);
+    }
+
+    static <R> IO<TFunction<Boolean, IO<R>>> ifM(IO<R> ifTrue, IO<R> ifFalse) {
+        return pure(condition -> condition ? ifTrue : ifFalse);
+    }
+
+    static IO<Unit> fork() {
+        return fork(commonPool());
+    }
+
+    static IO<Unit> fork(Executor executor) {
+        return callback -> executor.execute(() -> callback.accept(right(VALUE)));
+    }
+
+    static <R> Race<R> race(IO<R> lr, IO<R> rr) {
+        return new RaceImpl<>(lr, rr);
+    }
+
+    static <A, R> TFunction<A, IO<R>> by(TFunction<A, R> f) {
+        return f.andThenT(IO::pure);
+    }
+
+    static <A, R> TFunction<IO<A>, IO<R>> lift(TFunction<A, R> f) {
         return arg -> arg.map(f);
     }
 
     static <R> IO<R> delay(Callable<R> delayed) {
         return callback -> callback.accept(delayed.attempt());
-    }
-
-    static IO<Unit> fork(Executor executor) {
-        return pure(VALUE).shift(executor);
     }
 
     static <R> IO<R> never() {
@@ -236,8 +389,8 @@ public interface IO<R> extends Runnable {
         return callback -> callback.accept(action.attempt());
     }
 
-    static <R> IO<Function<Executor, IO<R>>> await(Future<R> blocker) {
-        return pure(executor -> fork(executor).as(blocker::get));
+    static <R> Await<R> await(Future<R> blocker) {
+        return new AwaitImpl<>(blocker);
     }
 
     static <R> IO<R> suspend(Callable<IO<R>> f) {
@@ -255,50 +408,24 @@ public interface IO<R> extends Runnable {
     }
 
     static <R> IO<R> raise(Throwable cause) {
-        return raise(ofInstance(cause));
+        return raise(ofInstanceT(cause));
     }
 
-    static <R> IO<R> raise(Supplier<Throwable> cause) {
-        return callback -> callback.accept(left(cause.get()));
+    static <R> IO<R> fromEither(Either<Throwable, R> e) {
+        return callback -> callback.accept(e);
     }
 
-    static <R> IO<Function<Executor, IO<Either<R, R>>>> race(IO<R> left, IO<R> right) {
-
-        Function<Executor, IO<Either<R, R>>> f = executor -> callback -> {
-
-            AtomicBoolean done = new AtomicBoolean(false);
-
-            Consumer<Either<Throwable, R>> fl = attempt -> {
-                if (done.compareAndSet(false, true)) {
-                    if (attempt.isLeft()) {
-                        (attempt.left()).forEach(cause -> callback.accept(left(cause)));
-                    } else {
-                        (attempt.right()).forEach(r -> callback.accept(right(left(r))));
-                    }
-                }
-            };
-
-            Consumer<Either<Throwable, R>> fr = attempt -> {
-                if (done.compareAndSet(false, true)) {
-                    if (attempt.isLeft()) {
-                        (attempt.left()).forEach(cause -> callback.accept(left(cause)));
-                    } else {
-                        (attempt.right()).forEach(r -> callback.accept(right(right(r))));
-                    }
-                }
-            };
-
-            left.shift(executor).run(fl);
-
-            right.shift(executor).run(fr);
-
+    static <R> IO<R> raise(TSupplier<Throwable> cause) {
+        return callback -> {
+            try {
+                callback.accept(left(cause.get()));
+            } catch (Throwable cause2) {
+                callback.accept(left(cause2));
+            }
         };
-
-        return pure(f);
-
     }
 
-    static <R> IO<R> async(Consumer<AsyncCallback<R>> scope) {
+    static <R> IO<R> async(TConsumer<AsyncCallback<R>> scope) {
         return callback -> {
             try {
                 scope.accept(wrap(callback));
@@ -308,110 +435,62 @@ public interface IO<R> extends Runnable {
         };
     }
 
-    static IO<Function<Scheduler, IO<Unit>>> sleep(long delay, TimeUnit unit) {
-        return pure(s -> s.schedule(delay, unit));
+    static Task<Unit> sleep(long delay, TimeUnit unit) {
+        return new SleepTask(delay, unit);
     }
 
-    static <R> IO<Function<Scheduler, IO<R>>> timeout(long delay, TimeUnit unit) {
-        return sleep(delay, unit).then(raise(TimeoutException::new));
+    static <R> Task<R> timeout(long delay, TimeUnit unit) {
+        return new TimeoutTask<>(delay, unit);
     }
 
-    @SafeVarargs
-    static <R> IO<Stream<R>> sequence(IO<R>... ops) {
-        return sequence(of(ops));
+    static <A> Extract<A> extract(Extractable<A> e) {
+        return callback -> callback.accept(right(e));
     }
 
-    static <R> IO<Stream<R>> sequence(Stream<IO<R>> ops) {
-
-        Callable<IO<Stream<R>>> f = () -> {
-
-            BinaryOperator<IO<Stream<R>>> concat = (a, b) -> {
-                return a.flatMap(as -> b.map(bs -> concat(as, bs)));
-            };
-
-            return ops.map(e -> e.map(Stream::of)).reduce(pure(empty()), concat);
-
-        };
-
-        return suspend(f);
-
+    static <A> Extract<A> extract(IO<A> fa) {
+        return fa.map(a -> ((Extractable<A>) Product.apply(a)))::run;
     }
 
-    static <R> Function<Boolean, IO<R>> ifM(IO<R> ifTrue, IO<R> ifFalse) {
-        return condition -> condition ? ifTrue : ifFalse;
+    static <A, B> Extract2<A, B> extract(Extractable2<A, B> e) {
+        return callback -> callback.accept(right(e));
     }
 
-    static <A> Monoid<IO<A>> monoidK(Monoid<A> monoid) {
-        return new Monoid<>() {
-            @Override
-            public IO<A> zero() {
-                return pure(monoid.zero());
-            }
-
-            @Override
-            public IO<A> append(IO<A> fa, IO<A> fb) {
-                return fa.flatMap(a -> fb.map(b -> monoid.append(a, b)));
-            }
-        };
+    static <A, B> Extract2<A, B> extract(IO<A> fa, IO<B> fb) {
+        return fa.flatMap(a -> fb.map(b -> ((Extractable2<A, B>) Product2.apply(a, b))))::run;
     }
 
-    @SafeVarargs
-    static <R> IO<Function<Monoid<R>, IO<R>>> foldMonoid(IO<R>... ops) {
-        return foldMonoid(of(ops));
+    static <A, B, C> Extract3<A, B, C> extract(Extractable3<A, B, C> e) {
+        return callback -> callback.accept(right(e));
     }
 
-    static <R> IO<Function<Monoid<R>, IO<R>>> foldMonoid(Stream<IO<R>> ops) {
-        return pure(monoid -> sequence(ops).map(s -> s.reduce(monoid.zero(), monoid::append)));
+    static <A, B, C> Extract3<A, B, C> extract(IO<A> fa, IO<B> fb, IO<C> fc) {
+        return fa.flatMap(a -> fb.flatMap(b -> fc.map(c -> ((Extractable3<A, B, C>) Product3.apply(a, b, c)))))::run;
     }
 
-    @SafeVarargs
-    static <R> IO<Function<BinaryOperator<R>, IO<Option<R>>>> reduce(IO<R>... ops) {
-        return reduce(of(ops));
+    static <A, B, C, D> Extract4<A, B, C, D> extract(IO<A> fa, IO<B> fb, IO<C> fc, IO<D> fd) {
+        return fa.flatMap(a -> fb.flatMap(b -> fc.flatMap(c -> fd.map(d -> ((Extractable4<A, B, C, D>) Product4.apply(a, b, c, d))))))::run;
     }
 
-    static <R> IO<Function<BinaryOperator<R>, IO<Option<R>>>> reduce(Stream<IO<R>> ops) {
-        return pure(accumulator -> sequence(ops).map(s -> fromOptional(s.reduce(accumulator))));
+    static <A, B, C, D> Extract4<A, B, C, D> extract(Extractable4<A, B, C, D> e) {
+        return callback -> callback.accept(right(e));
     }
 
-    @SafeVarargs
-    static <R> IO<BiFunction<R, BinaryOperator<R>, IO<R>>> foldLeft(IO<R>... ops) {
-        return foldLeft(of(ops));
+    static <A, B, C, D, E> Extract5<A, B, C, D, E> extract(Extractable5<A, B, C, D, E> e) {
+        return callback -> callback.accept(right(e));
     }
 
-    static <R> IO<BiFunction<R, BinaryOperator<R>, IO<R>>> foldLeft(Stream<IO<R>> ops) {
-        return pure((zero, accumulator) -> sequence(ops).map(s -> s.reduce(zero, accumulator)));
+    static <A, B, C, D, E> Extract5<A, B, C, D, E> extract(IO<A> fa, IO<B> fb, IO<C> fc, IO<D> fd, IO<E> fe) {
+        return fa.flatMap(a -> fb.flatMap(b -> fc.flatMap(c -> fd.flatMap(d -> fe.map(e -> ((Extractable5<A, B, C, D, E>) Product5.apply(a, b, c, d, e)))))))::run;
     }
 
-    static <A, B, R> Function<BiFunction<A, B, R>, R> apply(A a, B b) {
-        return f -> f.apply(a, b);
-    }
-
-    static <A, R> Function<Function<A, R>, R> apply(A a) {
-        return f -> f.apply(a);
-    }
-
-    private static <R> Consumer<Either<Throwable, R>> printStackTrace(PrintStream s) {
+    private static <R> TConsumer<Either<Throwable, R>> printStackTrace(PrintStream s) {
         return attempt -> (attempt.left()).forEach(cause -> cause.printStackTrace(s));
     }
 
-    private static <R> Consumer<Either<Throwable, R>> handle(Handler h) {
-        return attempt -> (attempt.left()).forEach(h::put);
-    }
-
-    private static <R> Consumer<Either<Throwable, R>> countDown(CountDownLatch onFinish) {
+    private static <R> TConsumer<Either<Throwable, R>> countDown(CountDownLatch onFinish) {
         return attempt -> {
             if (attempt.isRight()) {
                 onFinish.countDown();
-            }
-        };
-    }
-
-    private static <R> Consumer<Either<Throwable, R>> handleStatus(Consumer<ProgressStatus> onStatus) {
-        return attempt -> {
-            if (attempt.isRight()) {
-                onStatus.accept(SUCCESS);
-            } else {
-                onStatus.accept(FAILURE);
             }
         };
     }

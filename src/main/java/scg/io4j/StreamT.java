@@ -4,6 +4,8 @@ import io.atlassian.fugue.Monoid;
 import io.atlassian.fugue.Option;
 import io.atlassian.fugue.Unit;
 import lombok.RequiredArgsConstructor;
+import scg.io4j.utils.TFunction;
+import scg.io4j.utils.TPredicate;
 
 import java.util.*;
 import java.util.function.*;
@@ -23,32 +25,32 @@ public class StreamT<R> {
 
     public final IO<Stream<R>> value;
 
-    public <RR> StreamT<RR> map(Function<R, RR> f) {
+    public <RR> StreamT<RR> map(TFunction<R, RR> f) {
         return streamT(value.map(s -> s.map(f)));
     }
 
-    public <RR> StreamT<RR> flatMapM(Function<R, IO<Stream<RR>>> f) {
+    public <RR> StreamT<RR> flatMapM(TFunction<R, IO<Stream<RR>>> f) {
         return streamT(value.flatMap(s -> s.map(f).reduce(StreamT.<RR>empty().value, (a, b) -> a.flatMap(as -> b.map(bs -> concat(as, bs))))));
     }
 
-    public <RR> StreamT<RR> flatMap(Function<R, StreamT<RR>> f) {
+    public <RR> StreamT<RR> flatMap(TFunction<R, StreamT<RR>> f) {
         return flatMapM(item -> f.apply(item).value);
     }
 
-    public <RR> StreamT<RR> semiflatMap(Function<R, IO<RR>> f) {
+    public <RR> StreamT<RR> semiflatMap(TFunction<R, IO<RR>> f) {
         return flatMap(value -> eval(f.apply(value)));
     }
 
-    public <RR> StreamT<RR> subflatMap(Function<R, Stream<RR>> f) {
+    public <RR> StreamT<RR> subflatMap(TFunction<R, Stream<RR>> f) {
         return streamT(value.map(s -> s.flatMap(f)));
     }
 
-    public StreamT<R> filter(Predicate<R> p) {
+    public StreamT<R> filter(TPredicate<R> p) {
         return streamT(value.map(s -> s.filter(p)));
     }
 
-    public StreamT<R> filterNot(Predicate<R> p) {
-        return filter(p.negate());
+    public StreamT<R> filterNot(TPredicate<R> p) {
+        return filter(p.negateT());
     }
 
     public StreamT<R> limit(long maxSize) {
@@ -63,11 +65,11 @@ public class StreamT<R> {
         return this.value.map(s -> fromOptional(s.max(comparator)));
     }
 
-    public StreamT<R> dropWhile(Predicate<R> p) {
+    public StreamT<R> dropWhile(TPredicate<R> p) {
         return streamT(value.map(s -> s.dropWhile(p)));
     }
 
-    public StreamT<R> takeWhile(Predicate<R> p) {
+    public StreamT<R> takeWhile(TPredicate<R> p) {
         return streamT(value.map(s -> s.takeWhile(p)));
     }
 
@@ -83,15 +85,15 @@ public class StreamT<R> {
         return this.size().map(s -> (s == 0L));
     }
 
-    public IO<Option<R>> find(Predicate<R> p) {
+    public IO<Option<R>> find(TPredicate<R> p) {
         return this.value.map(s -> fromOptional(s.filter(p).findFirst()));
     }
 
-    public IO<Boolean> forall(Predicate<R> p) {
+    public IO<Boolean> forall(TPredicate<R> p) {
         return this.value.map(s -> s.allMatch(p));
     }
 
-    public IO<Boolean> exists(Predicate<R> p) {
+    public IO<Boolean> exists(TPredicate<R> p) {
         return this.value.map(s -> s.anyMatch(p));
     }
 
@@ -99,7 +101,7 @@ public class StreamT<R> {
         return this.value.flatMap(s -> unit(() -> s.forEach(action)));
     }
 
-    public <A> IO<Map<A, List<R>>> groupBy(Function<R, A> classifier) {
+    public <A> IO<Map<A, List<R>>> groupBy(TFunction<R, A> classifier) {
         return this.collect(groupingBy(classifier));
     }
 

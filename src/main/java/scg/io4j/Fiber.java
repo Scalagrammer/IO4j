@@ -11,11 +11,11 @@ public interface Fiber<R> {
 
     IO<R> join();
 
-    IO<Unit> cancel(boolean mayInterruptIfRunning);
-
     default IO<R> joinOn(Executor executor) {
-        return fork(executor).then(join());
+        return fork(executor).productR(join());
     }
+
+    IO<Unit> cancel(boolean mayInterruptIfRunning);
 
     default IO<Unit> cancel() {
         return this.cancel(false);

@@ -4,8 +4,10 @@ import io.atlassian.fugue.Maybe;
 import io.atlassian.fugue.Option;
 import io.atlassian.fugue.Pair;
 import lombok.RequiredArgsConstructor;
+import scg.io4j.utils.TFunction;
+import scg.io4j.utils.TPredicate;
+import scg.io4j.utils.TSupplier;
 
-import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
 
@@ -20,23 +22,23 @@ public class OptionT<R> {
 
     public final IO<Option<R>> value;
 
-    public <RR> OptionT<RR> map(Function<R, RR> f) {
+    public <RR> OptionT<RR> map(TFunction<R, RR> f) {
         return optionT(value.map(maybe -> maybe.map(f)));
     }
 
-    public <RR> OptionT<RR> flatMapM(Function<R, IO<Option<RR>>> f) {
+    public <RR> OptionT<RR> flatMapM(TFunction<R, IO<Option<RR>>> f) {
         return optionT(value.flatMap(maybe -> maybe.fold(() -> OptionT.<RR>none().value, f)));
     }
 
-    public <RR> OptionT<RR> flatMap(Function<R, OptionT<RR>> f) {
+    public <RR> OptionT<RR> flatMap(TFunction<R, OptionT<RR>> f) {
         return flatMapM(value -> f.apply(value).value);
     }
 
-    public <RR> OptionT<RR> semiflatMap(Function<R, IO<RR>> f) {
+    public <RR> OptionT<RR> semiflatMap(TFunction<R, IO<RR>> f) {
         return flatMap(value -> liftM(f.apply(value)));
     }
 
-    public <RR> OptionT<RR> subflatMap(Function<R, Option<RR>> f) {
+    public <RR> OptionT<RR> subflatMap(TFunction<R, Option<RR>> f) {
         return optionT(value.map(opt -> opt.flatMap(f)));
     }
 
@@ -52,15 +54,15 @@ public class OptionT<R> {
         return this.value.map(opt -> opt.getOrElse(defaultValue));
     }
 
-    public IO<R> or(Supplier<R> defaultValue) {
+    public IO<R> or(TSupplier<R> defaultValue) {
         return this.value.map(opt -> opt.getOrElse(defaultValue.get()));
     }
 
-    public IO<R> orGetM(Supplier<IO<R>> defaultValue) {
+    public IO<R> orGetM(TSupplier<IO<R>> defaultValue) {
         return this.value.flatMap(maybe -> maybe.fold(defaultValue, IO::pure));
     }
 
-    public IO<R> orElse(Supplier<IO<R>> defaultValue) {
+    public IO<R> orElse(TSupplier<IO<R>> defaultValue) {
         return orGetM(defaultValue);
     }
 
@@ -76,16 +78,16 @@ public class OptionT<R> {
         return this.map(clazz::cast);
     }
 
-    public <RR> RR as(Function<IO<Option<R>>, RR> f) {
+    public <RR> RR as(TFunction<IO<Option<R>>, RR> f) {
         return f.apply(value);
     }
 
-    public OptionT<R> filter(Predicate<R> p) {
+    public OptionT<R> filter(TPredicate<R> p) {
         return optionT(value.map(opt -> opt.filter(p)));
     }
 
-    public OptionT<R> filterNot(Predicate<R> p) {
-        return filter(p.negate());
+    public OptionT<R> filterNot(TPredicate<R> p) {
+        return filter(p.negateT());
     }
 
     public OptionT<R> orT(OptionT<R> defaultValue) {
@@ -136,4 +138,5 @@ public class OptionT<R> {
     public static <T> OptionT<T> optionT(IO<Option<T>> thunk) {
         return new OptionT<>(thunk);
     }
+
 }

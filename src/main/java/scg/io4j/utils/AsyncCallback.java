@@ -3,17 +3,16 @@ package scg.io4j.utils;
 import io.atlassian.fugue.Either;
 
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.function.Consumer;
 
 import static io.atlassian.fugue.Either.left;
 import static io.atlassian.fugue.Either.right;
 
 public interface AsyncCallback<R> {
 
-    void success(R result);
+    void success(R        result);
     void failure(Throwable cause);
 
-    static <R> AsyncCallback<R> wrap(Consumer<Either<Throwable, R>> f) {
+    static <R> AsyncCallback<R> wrap(TConsumer<Either<Throwable, R>> f) {
         return new AsyncCallback<>() {
 
             final AtomicBoolean done = new AtomicBoolean(false);
@@ -31,6 +30,7 @@ public interface AsyncCallback<R> {
                     f.accept(left(cause));
                 }
             }
+
         };
     }
 
