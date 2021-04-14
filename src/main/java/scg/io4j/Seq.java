@@ -21,15 +21,37 @@ import static scg.io4j.IO.*;
 
 public interface Seq<R> extends IO<Stream<R>> {
 
-    IO<R> traverse();
+    default IO<R> traverse() {
+        return callback -> {
 
-    IO<R> fold(Monoid<R> monoid);
+            TConsumer<Either<Throwable, Stream<R>>> f = attempt -> {
+                if (attempt.isLeft()) {
+                    (attempt.left()).forEach(cause -> callback.accept(left(cause)));
+                } else for (Stream<R> s : attempt.right()) {
+                    s.forEach(result -> callback.accept(right(result)));
+                }
+            };
 
-    IO<R> fold(R zero, TBinaryOperator<R> f);
+            this.run(f);
 
-    IO<Option<R>> reduce(TBinaryOperator<R> f);
+        };
+    }
 
-    <RR> IO<RR> foldMap(Monoid<RR> monoid, TFunction<R, RR> f);
+    default IO<R> fold(Monoid<R> monoid) {
+        return this.map(s -> s.reduce(monoid.zero(), monoid::append));
+    }
+
+    default IO<R> fold(R zero, TBinaryOperator<R> f) {
+        return this.map(s -> s.reduce(zero, f));
+    }
+
+    default IO<Option<R>> reduce(TBinaryOperator<R> f) {
+        return this.map(s -> fromOptional(s.reduce(f)));
+    }
+
+    default  <RR> IO<RR> foldMap(Monoid<RR> monoid, TFunction<R, RR> f) {
+        return this.map(s -> s.reduce(monoid.zero(), (rr, r) -> monoid.append(rr, f.apply(r)), monoid::append));
+    }
 
 }
 
@@ -44,43 +66,6 @@ final class SeqImpl<R> implements Seq<R> {
     };
 
     private final Stream<IO<R>> value;
-
-    @Override
-    public IO<R> traverse() {
-        return callback -> {
-
-            TConsumer<Either<Throwable, Stream<R>>> f = attempt -> {
-                if (attempt.isLeft()) {
-                    (attempt.left()).forEach(cause -> callback.accept(left(cause)));
-                } else for (val stream : attempt.right()) {
-                    stream.forEach(result -> callback.accept(right(result)));
-                }
-            };
-
-            this.run(f);
-
-        };
-    }
-
-    @Override
-    public IO<R> fold(Monoid<R> monoid) {
-        return this.map(s -> s.reduce(monoid.zero(), monoid::append));
-    }
-
-    @Override
-    public IO<R> fold(R zero, TBinaryOperator<R> f) {
-        return this.map(s -> s.reduce(zero, f));
-    }
-
-    @Override
-    public IO<Option<R>> reduce(TBinaryOperator<R> f) {
-        return this.map(s -> fromOptional(s.reduce(f)));
-    }
-
-    @Override
-    public <RR> IO<RR> foldMap(Monoid<RR> monoid, TFunction<R, RR> f) {
-        return this.map(s -> s.reduce(monoid.zero(), (rr, r) -> monoid.append(rr, f.apply(r)), monoid::append));
-    }
 
     @Override
     public void run(TConsumer<Either<Throwable, Stream<R>>> callback) {

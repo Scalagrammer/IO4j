@@ -1,35 +1,37 @@
 package scg.io4j;
 
-import io.atlassian.fugue.*;
+import io.atlassian.fugue.Either;
+import io.atlassian.fugue.Option;
+import io.atlassian.fugue.Unit;
 import lombok.val;
-import scg.io4j.utils.*;
 import scg.io4j.utils.Callable;
+import scg.io4j.utils.*;
 
 import java.io.PrintStream;
-
-import java.util.function.*;
 import java.util.concurrent.*;
+import java.util.function.Function;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
 import java.util.stream.Stream;
 
-import static java.lang.Thread.interrupted;
-import static java.time.Instant.now;
-import static java.util.Objects.nonNull;
-import static java.util.concurrent.ForkJoinPool.commonPool;
-import static java.util.stream.Stream.*;
-
-import static io.atlassian.fugue.Unit.VALUE;
 import static io.atlassian.fugue.Either.left;
 import static io.atlassian.fugue.Either.right;
 import static io.atlassian.fugue.Suppliers.ofInstance;
-
+import static io.atlassian.fugue.Unit.VALUE;
+import static java.lang.Thread.interrupted;
+import static java.util.Objects.nonNull;
+import static java.util.concurrent.ForkJoinPool.commonPool;
+import static java.util.stream.Stream.generate;
+import static java.util.stream.Stream.of;
 import static scg.io4j.Fiber.wrap;
 import static scg.io4j.OptionT.optionT;
 import static scg.io4j.utils.AsyncCallback.wrap;
 import static scg.io4j.utils.TFunction.constantT;
-import static scg.io4j.utils.TSupplier.ofInstanceT;
 
 @FunctionalInterface
 public interface IO<R> extends Runnable {
+
+    IO<Unit> U = pure(VALUE);
 
     void run(TConsumer<Either<Throwable, R>> callback);
 
@@ -93,7 +95,7 @@ public interface IO<R> extends Runnable {
     }
 
     @SuppressWarnings("StatementWithEmptyBody")
-    default <RR> IO<RR> tailRec(TFunction<R, IO<Either<R, RR>>> f) {
+    default <RR> IO<RR> tailrec(TFunction<R, IO<Either<R, RR>>> f) {
 
         class IOStack {
 
@@ -114,6 +116,7 @@ public interface IO<R> extends Runnable {
                 return defined;
 
             }
+
         }
 
         TConsumer<AsyncCallback<RR>> scope = callback -> {
@@ -142,6 +145,10 @@ public interface IO<R> extends Runnable {
 
         return IO.async(scope);
 
+    }
+
+    default <RR> IO<RR> forever(TFunction<R, IO<R>> it) {
+        return this.tailrec(it.andThenT(fr -> fr.map(Either::left)));
     }
 
     default IO<R> matchError(Class<? extends Throwable> causeType, Supplier<R> result) {
@@ -241,11 +248,11 @@ public interface IO<R> extends Runnable {
     }
 
     default IO<Unit> thenIf(Predicate<R> p, IO<Unit> then) {
-        return this.flatMap(r -> p.test(r) ? then : unit());
+        return this.flatMap(r -> p.test(r) ? then : U);
     }
 
     default IO<Unit> thenIfAsync(TFunction<R, IO<Boolean>> p, IO<Unit> then) {
-        return this.bind(p, (cond -> cond ? then : unit()));
+        return this.bind(p, (cond -> cond ? then : U));
     }
 
     default <RR> IO<RR> productR(IO<RR> right) {
@@ -390,10 +397,6 @@ public interface IO<R> extends Runnable {
         return callback -> {};
     }
 
-    static IO<Unit> unit() {
-        return pure(VALUE);
-    }
-
     static IO<Unit> unit(Action action) {
         return callback -> callback.accept(action.attempt());
     }
@@ -413,15 +416,11 @@ public interface IO<R> extends Runnable {
     }
 
     static <R> IO<R> pure(R value) {
-        return callback -> callback.accept(right(value));
+        return fromEither(right(value));
     }
 
     static <R> IO<R> raise(Throwable cause) {
-        return raise(ofInstanceT(cause));
-    }
-
-    static <R> IO<R> fromEither(Either<Throwable, R> e) {
-        return callback -> callback.accept(e);
+        return fromEither(left(cause));
     }
 
     static <R> IO<R> raise(TSupplier<Throwable> cause) {
@@ -432,6 +431,10 @@ public interface IO<R> extends Runnable {
                 callback.accept(left(cause2));
             }
         };
+    }
+
+    static <R> IO<R> fromEither(Either<Throwable, R> e) {
+        return callback -> callback.accept(e);
     }
 
     static <R> IO<R> async(TConsumer<AsyncCallback<R>> scope) {
@@ -450,16 +453,6 @@ public interface IO<R> extends Runnable {
 
     static <R> Task<R> timeout(long delay, TimeUnit unit) {
         return new TimeoutTask<>(delay, unit);
-    }
-
-    static <A> IO<A> forever(IO<A> fa) {
-        return callback -> {
-            try {
-                while (!interrupted()) fa.run(callback);
-            } catch (Throwable cause) {
-                callback.accept(left(cause));
-            }
-        };
     }
 
     static <A> Extract<A> extract(Extractable<A> e) {
@@ -500,6 +493,12 @@ public interface IO<R> extends Runnable {
 
     static <A, B, C, D, E> Extract5<A, B, C, D, E> extract(IO<A> fa, IO<B> fb, IO<C> fc, IO<D> fd, IO<E> fe) {
         return fa.flatMap(a -> fb.flatMap(b -> fc.flatMap(c -> fd.flatMap(d -> fe.map(e -> ((Extractable5<A, B, C, D, E>) Product5.apply(a, b, c, d, e)))))))::run;
+    }
+
+    static <R> IO<R> loop(IO<R> fr) {
+        return callback -> {
+            while (!interrupted()) fr.run(callback);
+        };
     }
 
     private static <R> TConsumer<Either<Throwable, R>> printStackTrace(PrintStream errors) {

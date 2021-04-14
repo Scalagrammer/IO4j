@@ -14,7 +14,9 @@ import static java.util.concurrent.Executors.*;
 import static io.atlassian.fugue.Unit.VALUE;
 import static scg.io4j.IO.unit;
 
-public interface Scheduler extends Executor, AutoCloseable {
+public interface Scheduler extends Executor {
+
+    IO<Unit> shutdown();
 
     IO<Unit> schedule(long delay, TimeUnit unit);
 
@@ -24,10 +26,6 @@ public interface Scheduler extends Executor, AutoCloseable {
 
     default <R> IO<R> timeout(long delay, TimeUnit unit) {
         return this.timeout(delay, unit, TimeoutException.instance);
-    }
-
-    default IO<Unit> shutdown() {
-        return unit(this::close);
     }
 
     static Scheduler fixed(String name, int corePoolSize) {
@@ -95,8 +93,8 @@ final class SchedulerImpl implements Scheduler {
     }
 
     @Override
-    public void close() {
-        this.executor.shutdown();
+    public IO<Unit> shutdown() {
+        return unit(executor::shutdownNow);
     }
 
     @Override
