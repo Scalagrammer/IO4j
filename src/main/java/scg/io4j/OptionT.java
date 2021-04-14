@@ -35,7 +35,7 @@ public class OptionT<R> {
     }
 
     public <RR> OptionT<RR> semiflatMap(TFunction<R, IO<RR>> f) {
-        return flatMap(value -> liftM(f.apply(value)));
+        return flatMap(value -> lift(f.apply(value)));
     }
 
     public <RR> OptionT<RR> subflatMap(TFunction<R, Option<RR>> f) {
@@ -66,7 +66,7 @@ public class OptionT<R> {
         return orGetM(defaultValue);
     }
 
-    public IO<R> orEmptyM() {
+    public IO<R> orEmpty() {
         return this.value.flatMap(maybe -> maybe.fold(IO::never, IO::pure));
     }
 
@@ -127,7 +127,7 @@ public class OptionT<R> {
         return optionT(IO.pure(option(nullable)));
     }
 
-    public static <T> OptionT<T> liftM(IO<T> thunk) {
+    public static <T> OptionT<T> lift(IO<T> thunk) {
         return optionT(thunk.map(Option::some));
     }
 
@@ -136,7 +136,7 @@ public class OptionT<R> {
     }
 
     public static <T> OptionT<T> optionT(IO<Option<T>> thunk) {
-        return new OptionT<>(thunk);
+        return new OptionT<T>(thunk);
     }
 
 }

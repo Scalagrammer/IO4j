@@ -11,6 +11,8 @@ import java.util.function.*;
 import java.util.concurrent.*;
 import java.util.stream.Stream;
 
+import static java.lang.Thread.interrupted;
+import static java.time.Instant.now;
 import static java.util.Objects.nonNull;
 import static java.util.concurrent.ForkJoinPool.commonPool;
 import static java.util.stream.Stream.*;
@@ -33,36 +35,37 @@ public interface IO<R> extends Runnable {
 
     @Override
     default void run() {
-        this.run(System.out);
+        this.run(System.err);
     }
 
-    default void run(PrintStream out) {
-        this.run(printStackTrace(out));
+    default void run(CountDownLatch latch) {
+        this.run(onSuccess(latch));
     }
 
-    default void run(CountDownLatch successor) {
-        this.run(countDown(successor));
+    default void run(PrintStream errors) {
+        this.run(printStackTrace(errors));
     }
 
-    default <RR> RR to(TFunction<IO<R>, RR> f) {
-        return f.apply(this);
+    default IO<R> cache() {
+        return new Cache<>(this);
     }
 
-    default CompletableFuture<R> toFuture(Executor executor) {
+    default CompletableFuture<R> promise(Executor executor) {
 
-        CompletableFuture<R> promise = new CompletableFuture<>();
+        CompletableFuture<R> f = new CompletableFuture<>();
 
         TConsumer<Either<Throwable, R>> callback = attempt -> {
             if (attempt.isRight()) {
-                (attempt.right()).forEach(promise::complete);
+                (attempt.right()).forEach(f::complete);
             } else {
-                (attempt.left()).forEach(promise::completeExceptionally);
+                (attempt.left()).forEach(f::completeExceptionally);
             }
         };
 
         executor.execute(() -> run(callback));
 
-        return promise;
+        return f;
+
     }
 
     default IO<String> show(Show<R> f) {
@@ -82,7 +85,7 @@ public interface IO<R> extends Runnable {
     }
 
     default IO<Fiber<R>> fiber(Executor executor) {
-        return delay(() -> wrap(toFuture(executor)));
+        return delay(() -> wrap(promise(executor)));
     }
 
     default IO<Either<Throwable, R>> attempt() {
@@ -90,11 +93,11 @@ public interface IO<R> extends Runnable {
     }
 
     @SuppressWarnings("StatementWithEmptyBody")
-    default <RR> IO<RR> tailRecM(TFunction<R, IO<Either<R, RR>>> loop) {
+    default <RR> IO<RR> tailRec(TFunction<R, IO<Either<R, RR>>> f) {
 
         class IOStack {
 
-            private IO<Either<R, RR>> top = flatMap(loop);
+            private IO<Either<R, RR>> top = flatMap(f);
 
             void push(IO<Either<R, RR>> e) { this.top = e; }
 
@@ -121,7 +124,7 @@ public interface IO<R> extends Runnable {
                 if (result.isRight()) {
                     (result.right()).forEach(callback::success);
                 } else {
-                    (result.swap()).map(loop).forEach(stack::push);
+                    (result.swap()).map(f).forEach(stack::push);
                 }
             };
 
@@ -151,19 +154,18 @@ public interface IO<R> extends Runnable {
                     return;
                 }
 
-                Consumer<Throwable> match = cause -> {
+                for (val cause : attempt.left()) {
                     if (causeType.isInstance(cause)) {
                         callback.accept(right(result.get()));
                     } else {
                         callback.accept(attempt);
                     }
-                };
-
-                (attempt.swap()).forEach(match);
+                }
 
             };
 
             this.run(catcher);
+
         };
     }
 
@@ -177,19 +179,18 @@ public interface IO<R> extends Runnable {
                     return;
                 }
 
-                Consumer<Throwable> match = cause -> {
+                for (val cause : attempt.left()) {
                     if (causeType.isInstance(cause)) {
                         result.run(callback);
                     } else {
                         callback.accept(attempt);
                     }
-                };
-
-                (attempt.swap()).forEach(match);
+                }
 
             };
 
             this.run(catcher);
+
         };
     }
 
@@ -200,38 +201,42 @@ public interface IO<R> extends Runnable {
     default IO<R> recover(TFunction<Throwable, R> f) {
         return callback -> {
 
-            Consumer<Throwable> onFailure = cause -> {
-                callback.accept(right(f.apply(cause)));
-            };
-
             TConsumer<Either<Throwable, R>> catcher = attempt -> {
+
                 if (attempt.isRight()) {
                     callback.accept(attempt);
-                } else {
-                    (attempt.left()).forEach(onFailure);
+                    return;
                 }
+
+                for (val cause : attempt.left()) {
+                    callback.accept(right(f.apply(cause)));
+                }
+
             };
 
             this.run(catcher);
+
         };
     }
 
     default IO<R> recoverWith(Function<Throwable, IO<R>> f) {
         return callback -> {
 
-            Consumer<Throwable> onFailure = cause -> {
-                f.apply(cause).run(callback);
-            };
-
             TConsumer<Either<Throwable, R>> catcher = attempt -> {
+
                 if (attempt.isRight()) {
                     callback.accept(attempt);
-                } else {
-                    (attempt.left()).forEach(onFailure);
+                    return;
                 }
+
+                for (val cause : attempt.left()) {
+                    f.apply(cause).run(callback);
+                }
+
             };
 
             this.run(catcher);
+
         };
     }
 
@@ -322,6 +327,10 @@ public interface IO<R> extends Runnable {
         return this.flatMap(f1).flatMap(f2).flatMap(f3).flatMap(f4).flatMap(f5);
     }
 
+    default Seq<R> replicate(long n) {
+        return seq(generate(() -> this).limit(n));
+    }
+
     default <RR> IO<RR> as(RR value) {
         return this.map(constantT(value));
     }
@@ -341,12 +350,12 @@ public interface IO<R> extends Runnable {
     }
 
     @SafeVarargs
-    static <R> Sequence<R> sequence(IO<R>... ops) {
-        return sequence(of(ops));
+    static <R> Seq<R> seq(IO<R>... ops) {
+        return seq(of(ops));
     }
 
-    static <R> Sequence<R> sequence(Stream<IO<R>> value) {
-        return new SequenceImpl<>(value);
+    static <R> Seq<R> seq(Stream<IO<R>> value) {
+        return new SeqImpl<>(value);
     }
 
     static <R> IO<TFunction<Boolean, IO<R>>> ifM(IO<R> ifTrue, IO<R> ifFalse) {
@@ -443,6 +452,16 @@ public interface IO<R> extends Runnable {
         return new TimeoutTask<>(delay, unit);
     }
 
+    static <A> IO<A> forever(IO<A> fa) {
+        return callback -> {
+            try {
+                while (!interrupted()) fa.run(callback);
+            } catch (Throwable cause) {
+                callback.accept(left(cause));
+            }
+        };
+    }
+
     static <A> Extract<A> extract(Extractable<A> e) {
         return callback -> callback.accept(right(e));
     }
@@ -483,15 +502,13 @@ public interface IO<R> extends Runnable {
         return fa.flatMap(a -> fb.flatMap(b -> fc.flatMap(c -> fd.flatMap(d -> fe.map(e -> ((Extractable5<A, B, C, D, E>) Product5.apply(a, b, c, d, e)))))))::run;
     }
 
-    private static <R> TConsumer<Either<Throwable, R>> printStackTrace(PrintStream s) {
-        return attempt -> (attempt.left()).forEach(cause -> cause.printStackTrace(s));
+    private static <R> TConsumer<Either<Throwable, R>> printStackTrace(PrintStream errors) {
+        return attempt -> (attempt.left()).forEach(cause -> cause.printStackTrace(errors));
     }
 
-    private static <R> TConsumer<Either<Throwable, R>> countDown(CountDownLatch onFinish) {
+    private static <R> TConsumer<Either<Throwable, R>> onSuccess(CountDownLatch successor) {
         return attempt -> {
-            if (attempt.isRight()) {
-                onFinish.countDown();
-            }
+            if (attempt.isRight()) successor.countDown();
         };
     }
 

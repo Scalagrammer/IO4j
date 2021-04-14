@@ -38,7 +38,7 @@ public class StreamT<R> {
     }
 
     public <RR> StreamT<RR> semiflatMap(TFunction<R, IO<RR>> f) {
-        return flatMap(value -> eval(f.apply(value)));
+        return flatMap(value -> lift(f.apply(value)));
     }
 
     public <RR> StreamT<RR> subflatMap(TFunction<R, Stream<RR>> f) {
@@ -55,6 +55,10 @@ public class StreamT<R> {
 
     public StreamT<R> limit(long maxSize) {
         return streamT(value.map(s -> s.limit(maxSize)));
+    }
+
+    public IO<Stream<R>> toIO() {
+        return this.value;
     }
 
     public IO<Option<R>> min(Comparator<R> comparator) {
@@ -122,7 +126,7 @@ public class StreamT<R> {
         return empty();
     }
 
-    public static <T> StreamT<T> eval(IO<T> thunk) {
+    public static <T> StreamT<T> lift(IO<T> thunk) {
         return streamT(thunk.map(Stream::of));
     }
 
@@ -149,4 +153,5 @@ public class StreamT<R> {
     public static <V> StreamT<V> pure(V head, V...tail) {
         return streamT(IO.pure(concat(of(head), of(tail))));
     }
+
 }
