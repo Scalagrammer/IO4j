@@ -15,8 +15,7 @@ import java.util.concurrent.*;
 import static io.atlassian.fugue.Unit.VALUE;
 import static java.util.concurrent.Executors.newScheduledThreadPool;
 import static java.util.concurrent.Executors.newSingleThreadScheduledExecutor;
-import static scg.io4j.IO.async;
-import static scg.io4j.IO.unit;
+import static scg.io4j.IO.*;
 import static scg.io4j.utils.TSupplier.ofInstanceT;
 
 public interface Scheduler extends Executor {
@@ -29,7 +28,19 @@ public interface Scheduler extends Executor {
 
     <R> IO<R> timeout(long delay, TimeUnit unit, TSupplier<Throwable> cause);
 
-    default  <R> IO<R> timeout(long delay, TimeUnit unit, Throwable cause) {
+    default <R> IO<R> fork(IO<R> source) {
+        return this.fork(false, source);
+    }
+
+    default IO<Unit> unit() {
+        return this.fork(U);
+    }
+
+    default <R> IO<R> forkInterruptible(IO<R> source) {
+        return this.fork(true, source);
+    }
+
+    default <R> IO<R> timeout(long delay, TimeUnit unit, Throwable cause) {
         return this.timeout(delay, unit, ofInstanceT(cause));
     }
 
@@ -121,7 +132,7 @@ final class SchedulerImpl implements Scheduler {
 
     @Override
     public IO<Unit> shutdown() {
-        return unit(executor::shutdownNow);
+        return IO.unit(executor::shutdownNow);
     }
 
     @Override

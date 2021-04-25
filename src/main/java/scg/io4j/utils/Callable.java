@@ -19,6 +19,8 @@ public interface Callable<R> extends AttemptCapable<R> {
         }
     }
 
+
+
     static <R> Callable<R> always(R value) {
         return () -> value;
     }

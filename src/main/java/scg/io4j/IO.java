@@ -14,7 +14,9 @@ import scg.io4j.IO.IOFrame;
 import scg.io4j.IO.ContextSwitch;
 
 import java.io.PrintStream;
-import java.util.function.Predicate;
+
+import java.util.NoSuchElementException;
+import java.util.Objects;
 import java.util.concurrent.Executor;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CompletableFuture;
@@ -30,13 +32,14 @@ import static java.util.Objects.isNull;
 import static java.util.Objects.nonNull;
 import static java.util.stream.StreamSupport.stream;
 
+import static scg.io4j.Fiber.wrap;
 import static scg.io4j.Context.empty;
 import static scg.io4j.Context.fromMap;
-import static scg.io4j.Fiber.wrap;
-import static scg.io4j.FiberCancelledException.FIBER_CANCELLED_EXCEPTION;
+
 import static scg.io4j.IO.*;
 import static scg.io4j.OptionT.optionT;
 import static scg.io4j.IOConnection.connect;
+import static scg.io4j.utils.Callable.always;
 import static scg.io4j.utils.TFunction.constantT;
 import static scg.io4j.utils.TFunctions.identityT;
 import static scg.io4j.Attempt.getAttemptInstance;
@@ -59,11 +62,11 @@ public interface IO<R> extends Runnable {
     }
 
     default void run(CountDownLatch latch) {
-        this.run(IO.onSuccess(latch));
+        this.run(onSuccess(latch));
     }
 
-    default void run(PrintStream errors) {
-        this.run(IO.printStackTrace(errors));
+    default void run(PrintStream err) {
+        this.run(printStackTrace(err));
     }
 
     default IO<R> enrich(Context context) {
@@ -79,29 +82,29 @@ public interface IO<R> extends Runnable {
     }
 
     default IO<R> cache() {
-
+        //
         val promise = new CompletableFuture<R>();
-        val ready   = new AtomicBoolean(false);
-
-        Action f = () -> {
+        //
+        val ready = new AtomicBoolean(false);
+        //
+        Action runCache = () -> {
             if (ready.compareAndSet(false, true)) run(promise);
         };
-
-        return unit(f).as(promise::get);
-
+        //
+        return unit(runCache).as(promise::get);
     }
 
     default CompletableFuture<R> promise(Executor executor) {
-        ///////////////////////////////////
-        val f = new CompletableFuture<R>();
-        ///////////////////////////////////////////////////////
+        //
+        val promise = new CompletableFuture<R>();
+        //
         TConsumer<Either<Throwable, R>> callback = attempt -> {
-            attempt.fold(f::completeExceptionally, f::complete);
+            attempt.fold(promise::completeExceptionally, promise::complete);
         };
-        //////////////////////////////////////
+        //
         executor.execute(() -> run(callback));
-        /////////
-        return f;
+        //
+        return promise;
     }
 
     default IO<Fiber<R>> start(Scheduler scheduler) {
@@ -113,25 +116,27 @@ public interface IO<R> extends Runnable {
     }
 
     default IO<Fiber<R>> start(boolean interruptible, Scheduler scheduler) {
-
+        //
         TConsumer<AsyncCallback<Fiber<R>>> scope = callback -> {
-
+            //
             val cancelable = connect(true);
-
+            //
             val promise = new CompletableFuture<R>();
-
-            TConsumer<Either<Throwable, R>> complete = e -> {
-                e.fold(promise::completeExceptionally, promise::complete);
+            //
+            TConsumer<Either<Throwable, R>> complete = attempt -> {
+                attempt.fold(promise::completeExceptionally, promise::complete);
             };
-
+            //
             runLoop(scheduler.fork(interruptible, this), (null), (cancelable), (null), (complete), (null));
-
+            //
             callback.success(wrap(promise, cancelable));
-
         };
-
+        //
         return async(scope);
+    }
 
+    default IO<R> shift(Scheduler scheduler) {
+        return this.bind((R value) -> scheduler.fork(pure(value)));
     }
 
     default IO<Either<Throwable, R>> attempt() {
@@ -139,11 +144,11 @@ public interface IO<R> extends Runnable {
     }
 
     default <RR> IO<RR> tailrec(TFunction<R, IO<Either<R, RR>>> f) {
-        ///////////////////////////////////////////
-        TFunction<Either<R, RR>, IO<RR>> g = e -> {
-            return e.fold((R r) -> pure(r).tailrec(f), IO::pure);
+        //
+        TFunction<Either<R, RR>, IO<RR>> g = attempt -> {
+            return attempt.fold((R value) -> pure(value).tailrec(f), IO::pure);
         };
-        ///////////////////////
+        //
         return this.bind(f, g);
     }
 
@@ -151,8 +156,8 @@ public interface IO<R> extends Runnable {
         return this.tailrec(loop.andThenT(fr -> fr.map(Either::left)));
     }
 
-    default IO<Unit> thenIf(Predicate<R> p, IO<Unit> then) {
-        return this.flatMap(r -> p.test(r) ? then : U);
+    default IO<Unit> thenIf(TFunction<R, Boolean> p, IO<Unit> then) {
+        return this.flatMap(p.andThenT(cond -> cond ? then : U));
     }
 
     default IO<Unit> thenIfAsync(TFunction<R, IO<Boolean>> p, IO<Unit> then) {
@@ -160,35 +165,35 @@ public interface IO<R> extends Runnable {
     }
 
     default <RR> IO<RR> productR(IO<RR> right) {
-        return this.flatMap(constantT(right));
+        return this.bind(constantT(right));
     }
 
     default <RR> IO<R> productL(IO<RR> right) {
-        return right.flatMap(constantT(this));
+        return right.bind(constantT(this));
     }
 
     default <RR> IO<Product2<R, RR>> tupleR(RR right) {
-        return this.map(r -> Product2.apply(r, right));
+        return this.map((R value) -> Product2.apply(value, right));
     }
 
     default <RR> IO<Product2<RR, R>> tupleL(RR right) {
-        return this.map(r -> Product2.apply(right, r));
+        return this.map((R value) -> Product2.apply(right, value));
     }
 
     default <RR> IO<Product2<R, RR>> mproduct(TFunction<R, IO<RR>> f) {
-        return this.flatMap(r -> f.applyT(r).map(rr -> Product2.apply(r, rr)));
+        return this.bind((R value) -> f.applyT(value).map((RR result) -> Product2.apply(value, result)));
     }
 
     default <RR> IO<Product2<RR, R>> mproductLeft(TFunction<R, IO<RR>> f) {
-        return this.flatMap(r -> f.applyT(r).map(rr -> Product2.apply(rr, r)));
+        return this.bind((R value) -> f.applyT(value).map((RR result) -> Product2.apply(result, value)));
     }
 
     default <RR> IO<Product2<R, RR>> fproduct(TFunction<R, RR> f) {
-        return this.map(r -> Product2.apply(r, f.applyT(r)));
+        return this.map((R value) -> Product2.apply(value, f.applyT(value)));
     }
 
     default <RR> IO<Product2<RR, R>> fproductLeft(TFunction<R, RR> f) {
-        return this.map(r -> Product2.apply(f.applyT(r), r));
+        return this.map((R value) -> Product2.apply(f.applyT(value), value));
     }
 
     default <RR> IO<RR> map(TFunction<R, RR> f) {
@@ -196,7 +201,7 @@ public interface IO<R> extends Runnable {
     }
 
     default IO<R> chainMap(Iterable<TFunction<R, R>> fs) {
-        return suspend(() -> map(stream(fs.spliterator(), false).reduce(identityT(), TFunction::andThenT)));
+        return suspend(() -> map(stream((fs.spliterator()), false).reduce((identityT()), TFunction::andThenT)));
     }
 
     default <RR> IO<RR> flatMap(TFunction<R, IO<RR>> f) {
@@ -232,21 +237,17 @@ public interface IO<R> extends Runnable {
     }
 
     default <RR> IO<R> flatTap(TFunction<R, IO<RR>> f) {
-        return this.flatMap(arg -> f.apply(arg).as(arg));
+        return this.bind((R value) -> f.applyT(value).as(value));
     }
 
-    // constructors
+    // constructor
 
-    static <L, R> IO<Option<Product2<L, R>>> tupled(IO<Option<L>> lf, IO<Option<R>> rf) {
-        return optionT(lf).flatMap(l -> optionT(rf).map(r -> Product2.apply(l, r))).toIO();
+    static <L, R> IO<Option<Product2<L, R>>> tupled(IO<Option<L>> fl, IO<Option<R>> fr) {
+        return optionT(fl).flatMap(valueL -> optionT(fr).map(valueR -> Product2.apply(valueL, valueR))).toIO();
     }
 
     static <R> IO<R> extractContext(TFunction<Context, R> f) {
         return new SuspendWithContext<>(f.andThenT(Pure::new));
-    }
-
-    static <R> IO<Option<R>> findInContext(Object key, Class<R> tag) {
-        return findInContext(key);
     }
 
     static <R> IO<Option<R>> findInContext(Object key) {
@@ -278,28 +279,28 @@ public interface IO<R> extends Runnable {
     }
 
     static <R> IO<R> raise(Throwable cause) {
-        return raise(() -> cause);
+        return raise(always(cause));
     }
 
     static <R> IO<R> raise(Callable<Throwable> cause) {
         return new Raise<>(cause);
     }
 
-    static <R> IO<R> fromEither(Either<Throwable, R> e) {
-        return e.fold(IO::raise, IO::pure);
+    static <R> IO<R> fromEither(Either<Throwable, R> attempt) {
+        return attempt.fold(IO::raise, IO::pure);
     }
 
     static <A> IO<A> async(TConsumer<AsyncCallback<A>> scope) {
-
+        //
         TBiConsumer<IOConnection, TConsumer<Either<Throwable, A>>> f = (connected, callback) -> {
-
+            //
             AtomicBoolean done = new AtomicBoolean(false);
-
+            //
             val idempotent = new AsyncCallback<A>() {
                 @Override
-                public void success(A result) {
+                public void success(A value) {
                     if (done.compareAndSet(false, true)) {
-                        callback.accept(right(result));
+                        callback.accept(right(value));
                     }
                 }
 
@@ -310,28 +311,26 @@ public interface IO<R> extends Runnable {
                     }
                 }
             };
-
+            //
             try {
                 scope.accept(idempotent);
             } catch (Throwable cause) {
                 callback.accept(left(cause));
             }
-
         };
-
+        //
         return new Async<>(false, f);
-
     }
 
     static <R> IO<Unit> loop(IO<R> body) {
         return U.forever(constantT(body.productR(U)));
     }
 
-    private static <R> TConsumer<Either<Throwable, R>> printStackTrace(PrintStream errors) {
-        return attempt -> (attempt.left()).forEach(cause -> cause.printStackTrace(errors));
+    static <R> TConsumer<Either<Throwable, R>> printStackTrace(PrintStream err) {
+        return attempt -> (attempt.left()).forEach(cause -> cause.printStackTrace(err));
     }
 
-    private static <R> TConsumer<Either<Throwable, R>> onSuccess(CountDownLatch successor) {
+    static <R> TConsumer<Either<Throwable, R>> onSuccess(CountDownLatch successor) {
         return attempt -> {
             if (attempt.isRight()) successor.countDown();
         };
@@ -344,13 +343,13 @@ public interface IO<R> extends Runnable {
                            , RestartCallback<R> restart
                            , TConsumer<Either<Throwable, R>> callback
                            , ArrayStack<TFunction<Object, IO<Object>>> bindRest ) {
-        //
-        Context currentContext = empty;
-        //
+        /////////////////
         R value = (null);
-        //
+        ///////////////////////////////
+        Context currentContext = empty;
+        //////////////////////////////////////////
         RestartCallback restartCallback = restart;
-        //
+        //////////////
         while (true) {
             //
             if (source instanceof ContextBind) {
@@ -385,11 +384,19 @@ public interface IO<R> extends Runnable {
                 //
                 value = (R) ((Pure) source).value;
                 //
+                if (isNull(value)) {
+                    throw new NullPointerException("pure(null)");
+                }
+                //
                 source = (null);
                 //
             } else if (source instanceof Delay) try {
                 //
                 value = (R) ((Delay) source).f.call();
+                //
+                if (isNull(value)) {
+                    throw new NullPointerException("delay(() -> null)");
+                }
                 //
                 source = (null);
                 //
@@ -413,7 +420,7 @@ public interface IO<R> extends Runnable {
                     //
                     callback.accept(left(((Throwable) merge(((Raise) source).cause.attempt()))));
                     //
-                    return;
+                    return; // done
                     //
                 } else try {
                     //
@@ -428,6 +435,7 @@ public interface IO<R> extends Runnable {
                     bindFirst = (null);
                     //
                 }
+                //
             } else if (source instanceof Async) {
                 //
                 if (isNull(connected)) connected = connect(true);
@@ -465,6 +473,7 @@ public interface IO<R> extends Runnable {
                         source = new Bind(next, new RestoreContext(connect, restore));
                         //
                     }
+                    //
                 }
                 //
             } else if (source instanceof Map) {
@@ -482,7 +491,9 @@ public interface IO<R> extends Runnable {
                 source = ((Map) source).source;
                 //
             } else {
+                //
                 throw new RuntimeException("Unknown IO constructor");
+                //
             }
             //
             if (nonNull(value)) {
@@ -499,7 +510,7 @@ public interface IO<R> extends Runnable {
                     //
                 } finally {
                     //
-                    value     = (null);
+                    value = (null);
                     //
                     bindFirst = (null);
                     //
@@ -508,7 +519,6 @@ public interface IO<R> extends Runnable {
                     callback.accept(right(value));
                     //
                     return; // done
-                    //
                 }
             }
         }
@@ -521,30 +531,29 @@ public interface IO<R> extends Runnable {
 
         if (isNull(bindRest)) return (null);
 
-        var bindNext = bindRest.pop();
+        while (true) {
 
-        while (true) if (isNull(bindNext)) {
-            return (null);
-        } else if (!(bindNext instanceof ErrorHandler)) {
-            return (bindNext);
+            bindFirst = bindRest.pop();
+
+            if (isNull(bindFirst) || !(bindFirst instanceof ErrorHandler)) {
+                return bindFirst;
+            }
         }
     }
 
-    static IOFrame<Object, IO<Object>> findHandler( TFunction<Object, IO<Object>> bind
-                                                  , ArrayStack<TFunction<Object, IO<Object>>> binds ) {
+    static IOFrame<Object, IO<Object>> findHandler( TFunction<Object, IO<Object>> bindFirst
+                                                  , ArrayStack<TFunction<Object, IO<Object>>> bindRest ) {
 
-        if (bind instanceof IOFrame) {
-            return (IOFrame<Object, IO<Object>>) bind;
-        } else if (isNull(binds)) {
+        if (bindFirst instanceof IOFrame) {
+            return (IOFrame<Object, IO<Object>>) bindFirst;
+        } else if (isNull(bindRest)) {
             return (null);
         } else while (true) {
 
-            val pop = binds.pop();
+            bindFirst = bindRest.pop();
 
-            if (isNull(pop)) {
-                return (null);
-            } else if (pop instanceof IOFrame) {
-                return (IOFrame<Object, IO<Object>>) pop;
+            if (isNull(bindFirst) || (bindFirst instanceof IOFrame)) {
+                return (IOFrame<Object, IO<Object>>) bindFirst;
             }
         }
     }
@@ -575,6 +584,7 @@ public interface IO<R> extends Runnable {
         public IO<B> applyT(A arg) throws Throwable {
             return f.andThenT(Pure::new).applyT(arg);
         }
+
     }
 
     @Value
@@ -635,16 +645,17 @@ final class RestartCallback<A> implements TConsumer<Either<Throwable, A>>, Runna
 
     private final TConsumer<Either<Throwable, A>> callback;
 
-    private IOConnection connection;
+    private boolean callable = false;
 
-    private boolean callable        = false;
+    private IOConnection connection = null;
+
     private boolean trampolineAfter = false;
+
+    private Either<Throwable, A> value = null;
 
     private TFunction<Object, IO<Object>> bindFirst = null;
 
     private ArrayStack<TFunction<Object, IO<Object>>> bindRest = null;
-
-    private Either<Throwable, A> value = null;
 
     RestartCallback<A> switchContext(IOConnection connection) {
         this.connection = connection;
@@ -657,20 +668,12 @@ final class RestartCallback<A> implements TConsumer<Either<Throwable, A>>, Runna
         //
         this.callable = true;
         //
-        this.bindRest  = bindRest;
+        this.bindRest  =  bindRest;
         this.bindFirst = bindFirst;
         //
         this.trampolineAfter = task.isTrampolineAfter();
         //
         (task.getCallback()).accept(connection, this);
-    }
-
-    private void signal(Either<Throwable, A> e) {
-        // Auto-cancelable logic: in case the connection was cancelled,
-        // we interrupt the bind continuation
-        if (!connection.isCanceled()) {
-            runLoop(fromEither(e), bindFirst, connection, this, callback, bindRest);
-        }
     }
 
     @Override
@@ -685,22 +688,29 @@ final class RestartCallback<A> implements TConsumer<Either<Throwable, A>>, Runna
     }
 
     @Override
-    public void acceptT(Either<Throwable, A> e) {
+    public void acceptT(Either<Throwable, A> attempt) {
         if (callable) {
             //
             this.callable = false;
             //
             if (trampolineAfter) {
                 //
-                this.value = e;
+                this.value = attempt;
                 //
                 this.run();
                 //
-            } else {
-                this.signal(e);
-            }
+            } else this.signal(attempt);
         }
     }
+
+    private void signal(Either<Throwable, A> attempt) {
+        // Auto-cancelable logic: in case the connection was cancelled,
+        // we interrupt the bind continuation
+        if (!connection.isCanceled()) {
+            runLoop(fromEither(attempt), (bindFirst), (connection), this, (callback), (bindRest));
+        }
+    }
+
 }
 
 @RequiredArgsConstructor
