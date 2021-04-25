@@ -1,15 +1,16 @@
 package scg.io4j;
 
+import io.atlassian.fugue.Either;
 import io.atlassian.fugue.Unit;
 import lombok.RequiredArgsConstructor;
+import lombok.val;
+import scg.io4j.IO.Async;
 import scg.io4j.utils.NamingThreadFactory;
+import scg.io4j.utils.TBiConsumer;
 import scg.io4j.utils.TConsumer;
 import scg.io4j.utils.TSupplier;
 
-import java.util.concurrent.Executor;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 
 import static io.atlassian.fugue.Unit.VALUE;
 import static java.util.concurrent.Executors.newScheduledThreadPool;
@@ -22,7 +23,7 @@ public interface Scheduler extends Executor {
 
     IO<Unit> shutdown();
 
-    IO<Unit> fork();
+    <R> IO<R> fork(boolean interruptible, IO<R> source);
 
     IO<Unit> schedule(long delay, TimeUnit unit);
 
@@ -104,13 +105,18 @@ final class SchedulerImpl implements Scheduler {
     }
 
     @Override
-    public IO<Unit> fork() {
-        ////////////////////////////////////////////////////
-        TConsumer<AsyncCallback<Unit>> scope = callback -> {
-            this.executor.execute(() -> callback.success(VALUE));
+    public <R> IO<R> fork(boolean interruptible, IO<R> source) {
+
+        TBiConsumer<IOConnection, TConsumer<Either<Throwable, R>>> scope = (connect, callback) -> {
+
+            val handle = executor.submit(() -> source.run(callback));
+
+            connect.push(() -> handle.cancel(interruptible));
+
         };
-        ////////////////////
-        return async(scope);
+
+        return new Async<>(false, scope);
+
     }
 
     @Override

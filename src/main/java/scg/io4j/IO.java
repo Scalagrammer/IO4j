@@ -33,6 +33,7 @@ import static java.util.stream.StreamSupport.stream;
 import static scg.io4j.Context.empty;
 import static scg.io4j.Context.fromMap;
 import static scg.io4j.Fiber.wrap;
+import static scg.io4j.FiberCancelledException.FIBER_CANCELLED_EXCEPTION;
 import static scg.io4j.IO.*;
 import static scg.io4j.OptionT.optionT;
 import static scg.io4j.IOConnection.connect;
@@ -51,6 +52,10 @@ public interface IO<R> extends Runnable {
 
     default void run(TConsumer<Either<Throwable, R>> callback) {
         runLoop(this, (null), connect(false), (null), callback, (null));
+    }
+
+    default void run(CompletableFuture<R> callback) {
+        this.run(attempt -> attempt.fold(callback::completeExceptionally, callback::complete));
     }
 
     default void run(CountDownLatch latch) {
@@ -73,16 +78,25 @@ public interface IO<R> extends Runnable {
         return this.enrich(fromMap(context));
     }
 
+    default IO<R> cache() {
+
+        val promise = new CompletableFuture<R>();
+        val ready   = new AtomicBoolean(false);
+
+        Action f = () -> {
+            if (ready.compareAndSet(false, true)) run(promise);
+        };
+
+        return unit(f).as(promise::get);
+
+    }
+
     default CompletableFuture<R> promise(Executor executor) {
         ///////////////////////////////////
         val f = new CompletableFuture<R>();
         ///////////////////////////////////////////////////////
         TConsumer<Either<Throwable, R>> callback = attempt -> {
-            if (attempt.isRight()) {
-                (attempt.right()).forEach(f::complete);
-            } else {
-                (attempt.left()).forEach(f::completeExceptionally);
-            }
+            attempt.fold(f::completeExceptionally, f::complete);
         };
         //////////////////////////////////////
         executor.execute(() -> run(callback));
@@ -91,20 +105,28 @@ public interface IO<R> extends Runnable {
     }
 
     default IO<Fiber<R>> start(Scheduler scheduler) {
+        return this.start(false, scheduler);
+    }
+
+    default IO<Fiber<R>> startInterruptible(Scheduler scheduler) {
+        return this.start(true, scheduler);
+    }
+
+    default IO<Fiber<R>> start(boolean interruptible, Scheduler scheduler) {
 
         TConsumer<AsyncCallback<Fiber<R>>> scope = callback -> {
 
-            val connect = connect(true);
+            val cancelable = connect(true);
 
             val promise = new CompletableFuture<R>();
 
-            TConsumer<Either<Throwable, R>> fold = e -> {
+            TConsumer<Either<Throwable, R>> complete = e -> {
                 e.fold(promise::completeExceptionally, promise::complete);
             };
 
-            runLoop((scheduler.fork()).productR(this), (null), (connect), (null), (fold), (null));
+            runLoop(scheduler.fork(interruptible, this), (null), (cancelable), (null), (complete), (null));
 
-            callback.success(wrap(promise, connect));
+            callback.success(wrap(promise, cancelable));
 
         };
 

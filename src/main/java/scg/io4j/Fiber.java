@@ -17,12 +17,12 @@ public interface Fiber<R> {
 
     IO<Unit> cancel();
 
-    static <R> Fiber<R> wrap(CompletableFuture<R> f, IOConnection connected) {
+    static <R> Fiber<R> wrap(CompletableFuture<R> promise, IOConnection connected) {
 
         return new Fiber<>() {
             @Override
             public IO<R> join() {
-                return delay(f::join);
+                return delay(promise::join);
             }
 
             @Override

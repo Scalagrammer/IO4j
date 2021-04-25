@@ -5,6 +5,7 @@ import lombok.NoArgsConstructor;
 import lombok.RequiredArgsConstructor;
 import lombok.val;
 import scg.io4j.IO.IOFrame;
+import scg.io4j.utils.Action;
 import scg.io4j.utils.Callable;
 
 import java.util.Iterator;
@@ -14,8 +15,7 @@ import static java.util.Arrays.asList;
 import static java.util.Objects.isNull;
 import static lombok.AccessLevel.PACKAGE;
 import static scg.io4j.FList.nil;
-import static scg.io4j.IO.U;
-import static scg.io4j.IO.raise;
+import static scg.io4j.IO.*;
 import static scg.io4j.IOPlatform.composeErrors;
 
 @NoArgsConstructor(access = PACKAGE)
@@ -32,6 +32,10 @@ public abstract class IOConnection {
     abstract public void pushPair(IOConnection lc, IOConnection rc);
 
     abstract public boolean tryReactivate();
+
+    public void push(Action tokenAction) {
+        this.push(unit(tokenAction));
+    }
 
     public static IOConnection connect(boolean cancelable) {
         return cancelable ? (new Cancelable()) : Uncancelable.instance;
@@ -91,6 +95,7 @@ public abstract class IOConnection {
         public boolean tryReactivate() {
             return true;
         }
+
     }
 
     private static final class Cancelable extends IOConnection {
@@ -123,9 +128,7 @@ public abstract class IOConnection {
 
                 val s = state.get();
 
-                if (s.isEmpty()) { cancelable.run() ; break ; }
-
-                else if (state.compareAndSet(s, s.prepend(cancelable))) break ;
+                if (state.compareAndSet(s, s.prepend(cancelable))) break ;
 
             }
         }

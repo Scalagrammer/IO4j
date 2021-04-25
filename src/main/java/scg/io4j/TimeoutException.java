@@ -4,9 +4,9 @@ import io.atlassian.fugue.Either;
 
 import static io.atlassian.fugue.Either.left;
 
-public final class TimeoutException extends Throwable {
+final class TimeoutException extends Throwable {
 
-    public static final Throwable instance = new TimeoutException();
+    static final Throwable instance = new TimeoutException();
 
     private static final Either<Throwable, ?> leftProjection = left(instance);
 
