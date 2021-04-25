@@ -3,6 +3,10 @@ package scg.io4j.utils;
 import lombok.Value;
 import scg.io4j.IO;
 
+import java.util.StringJoiner;
+
+import static java.lang.String.valueOf;
+
 public interface Product2<A, B> extends Extractable2<A, B> {
 
     A get_1();
@@ -21,6 +25,13 @@ public interface Product2<A, B> extends Extractable2<A, B> {
 
 @Value
 class Product2Impl<A, B> implements Product2<A, B> {
+
     A _1;
     B _2;
+
+    @Override
+    public String toString() {
+        return ("(") + (_1) + (", ") + (_2) + (")");
+    }
+
 }

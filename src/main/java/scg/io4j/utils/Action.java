@@ -8,7 +8,7 @@ import static io.atlassian.fugue.Either.right;
 import static io.atlassian.fugue.Unit.VALUE;
 
 @FunctionalInterface
-public interface Action extends Attempt<Unit> {
+public interface Action extends AttemptCapable<Unit> {
 
     void perform() throws Throwable;
 

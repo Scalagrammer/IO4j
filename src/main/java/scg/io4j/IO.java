@@ -1,61 +1,82 @@
 package scg.io4j;
 
+import io.atlassian.fugue.Unit;
 import io.atlassian.fugue.Either;
 import io.atlassian.fugue.Option;
-import io.atlassian.fugue.Unit;
+
 import lombok.val;
-import scg.io4j.utils.Callable;
+import lombok.Value;
+import lombok.RequiredArgsConstructor;
+
 import scg.io4j.utils.*;
+import scg.io4j.IO.Async;
+import scg.io4j.IO.IOFrame;
+import scg.io4j.IO.ContextSwitch;
 
 import java.io.PrintStream;
-import java.util.concurrent.*;
-import java.util.function.Function;
 import java.util.function.Predicate;
-import java.util.function.Supplier;
-import java.util.stream.Stream;
+import java.util.concurrent.Executor;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
 
+import static io.atlassian.fugue.Unit.VALUE;
 import static io.atlassian.fugue.Either.left;
 import static io.atlassian.fugue.Either.right;
-import static io.atlassian.fugue.Suppliers.ofInstance;
-import static io.atlassian.fugue.Unit.VALUE;
-import static java.lang.Thread.interrupted;
-import static java.util.Objects.nonNull;
-import static java.util.concurrent.ForkJoinPool.commonPool;
-import static java.util.stream.Stream.generate;
-import static java.util.stream.Stream.of;
-import static scg.io4j.Fiber.wrap;
-import static scg.io4j.OptionT.optionT;
-import static scg.io4j.utils.AsyncCallback.wrap;
-import static scg.io4j.utils.TFunction.constantT;
+import static io.atlassian.fugue.Eithers.merge;
 
-@FunctionalInterface
+import static java.util.Map.of;
+import static java.util.Objects.isNull;
+import static java.util.Objects.nonNull;
+import static java.util.stream.StreamSupport.stream;
+
+import static scg.io4j.Context.empty;
+import static scg.io4j.Context.fromMap;
+import static scg.io4j.Fiber.wrap;
+import static scg.io4j.IO.*;
+import static scg.io4j.OptionT.optionT;
+import static scg.io4j.IOConnection.connect;
+import static scg.io4j.utils.TFunction.constantT;
+import static scg.io4j.utils.TFunctions.identityT;
+import static scg.io4j.Attempt.getAttemptInstance;
+
 public interface IO<R> extends Runnable {
 
     IO<Unit> U = pure(VALUE);
-
-    void run(TConsumer<Either<Throwable, R>> callback);
 
     @Override
     default void run() {
         this.run(System.err);
     }
 
+    default void run(TConsumer<Either<Throwable, R>> callback) {
+        runLoop(this, (null), connect(false), (null), callback, (null));
+    }
+
     default void run(CountDownLatch latch) {
-        this.run(onSuccess(latch));
+        this.run(IO.onSuccess(latch));
     }
 
     default void run(PrintStream errors) {
-        this.run(printStackTrace(errors));
+        this.run(IO.printStackTrace(errors));
     }
 
-    default IO<R> cache() {
-        return new Cache<>(this);
+    default IO<R> enrich(Context context) {
+        return new ContextBind<>(this, context);
+    }
+
+    default IO<R> enrich(Object key, Object value) {
+        return this.enrich(of(key, value));
+    }
+
+    default IO<R> enrich(java.util.Map<Object, Object> context) {
+        return this.enrich(fromMap(context));
     }
 
     default CompletableFuture<R> promise(Executor executor) {
-
-        CompletableFuture<R> f = new CompletableFuture<>();
-
+        ///////////////////////////////////
+        val f = new CompletableFuture<R>();
+        ///////////////////////////////////////////////////////
         TConsumer<Either<Throwable, R>> callback = attempt -> {
             if (attempt.isRight()) {
                 (attempt.right()).forEach(f::complete);
@@ -63,188 +84,49 @@ public interface IO<R> extends Runnable {
                 (attempt.left()).forEach(f::completeExceptionally);
             }
         };
-
+        //////////////////////////////////////
         executor.execute(() -> run(callback));
-
+        /////////
         return f;
-
     }
 
-    default IO<String> show(Show<R> f) {
-        return this.map(f);
-    }
+    default IO<Fiber<R>> start(Scheduler scheduler) {
 
-    default IO<R> shift() {
-        return this.shift(commonPool());
-    }
+        TConsumer<AsyncCallback<Fiber<R>>> scope = callback -> {
 
-    default IO<R> shift(Executor executor) {
-        return callback -> executor.execute(() -> run(callback));
-    }
+            val connect = connect(true);
 
-    default IO<Fiber<R>> fiber() {
-        return this.fiber(commonPool());
-    }
+            val promise = new CompletableFuture<R>();
 
-    default IO<Fiber<R>> fiber(Executor executor) {
-        return delay(() -> wrap(promise(executor)));
+            TConsumer<Either<Throwable, R>> fold = e -> {
+                e.fold(promise::completeExceptionally, promise::complete);
+            };
+
+            runLoop((scheduler.fork()).productR(this), (null), (connect), (null), (fold), (null));
+
+            callback.success(wrap(promise, connect));
+
+        };
+
+        return async(scope);
+
     }
 
     default IO<Either<Throwable, R>> attempt() {
-        return callback -> run(attempt -> callback.accept(right(attempt)));
+        return new Bind<>(this, getAttemptInstance());
     }
 
-    @SuppressWarnings("StatementWithEmptyBody")
     default <RR> IO<RR> tailrec(TFunction<R, IO<Either<R, RR>>> f) {
-
-        class IOStack {
-
-            private IO<Either<R, RR>> top = flatMap(f);
-
-            void push(IO<Either<R, RR>> e) { this.top = e; }
-
-            boolean popAndRun(TConsumer<Either<Throwable, Either<R, RR>>> callback) {
-
-                val local = this.top; // get current
-
-                this.top = (null); // "reset" state ("pop")
-
-                val defined = nonNull(local);
-
-                if (defined) local.run(callback); // run callback if exists
-
-                return defined;
-
-            }
-
-        }
-
-        TConsumer<AsyncCallback<RR>> scope = callback -> {
-
-            IOStack stack = new IOStack();
-
-            TConsumer<Either<R, RR>> onSuccess = result -> {
-                if (result.isRight()) {
-                    (result.right()).forEach(callback::success);
-                } else {
-                    (result.swap()).map(f).forEach(stack::push);
-                }
-            };
-
-            TConsumer<Either<Throwable, Either<R, RR>>> iteration = attempt -> {
-                if (attempt.isRight()) {
-                    (attempt.right()).forEach(onSuccess);
-                } else {
-                    (attempt.left()).forEach(callback::failure);
-                }
-            };
-
-            while (stack.popAndRun(iteration));
-
+        ///////////////////////////////////////////
+        TFunction<Either<R, RR>, IO<RR>> g = e -> {
+            return e.fold((R r) -> pure(r).tailrec(f), IO::pure);
         };
-
-        return IO.async(scope);
-
+        ///////////////////////
+        return this.bind(f, g);
     }
 
-    default <RR> IO<RR> forever(TFunction<R, IO<R>> it) {
-        return this.tailrec(it.andThenT(fr -> fr.map(Either::left)));
-    }
-
-    default IO<R> matchError(Class<? extends Throwable> causeType, Supplier<R> result) {
-        return callback -> {
-
-            TConsumer<Either<Throwable, R>> catcher = attempt -> {
-
-                if (attempt.isRight()) {
-                    callback.accept(attempt);
-                    return;
-                }
-
-                for (val cause : attempt.left()) {
-                    if (causeType.isInstance(cause)) {
-                        callback.accept(right(result.get()));
-                    } else {
-                        callback.accept(attempt);
-                    }
-                }
-
-            };
-
-            this.run(catcher);
-
-        };
-    }
-
-    default IO<R> matchErrorWith(Class<? extends Throwable> causeType, IO<R> result) {
-        return callback -> {
-
-            TConsumer<Either<Throwable, R>> catcher = attempt -> {
-
-                if (attempt.isRight()) {
-                    callback.accept(attempt);
-                    return;
-                }
-
-                for (val cause : attempt.left()) {
-                    if (causeType.isInstance(cause)) {
-                        result.run(callback);
-                    } else {
-                        callback.accept(attempt);
-                    }
-                }
-
-            };
-
-            this.run(catcher);
-
-        };
-    }
-
-    default IO<R> matchError(Class<? extends Throwable> causeType, R result) {
-        return this.matchError(causeType, ofInstance(result));
-    }
-
-    default IO<R> recover(TFunction<Throwable, R> f) {
-        return callback -> {
-
-            TConsumer<Either<Throwable, R>> catcher = attempt -> {
-
-                if (attempt.isRight()) {
-                    callback.accept(attempt);
-                    return;
-                }
-
-                for (val cause : attempt.left()) {
-                    callback.accept(right(f.apply(cause)));
-                }
-
-            };
-
-            this.run(catcher);
-
-        };
-    }
-
-    default IO<R> recoverWith(Function<Throwable, IO<R>> f) {
-        return callback -> {
-
-            TConsumer<Either<Throwable, R>> catcher = attempt -> {
-
-                if (attempt.isRight()) {
-                    callback.accept(attempt);
-                    return;
-                }
-
-                for (val cause : attempt.left()) {
-                    f.apply(cause).run(callback);
-                }
-
-            };
-
-            this.run(catcher);
-
-        };
+    default IO<Unit> forever(TFunction<R, IO<R>> loop) {
+        return this.tailrec(loop.andThenT(fr -> fr.map(Either::left)));
     }
 
     default IO<Unit> thenIf(Predicate<R> p, IO<Unit> then) {
@@ -271,71 +153,52 @@ public interface IO<R> extends Runnable {
         return this.map(r -> Product2.apply(right, r));
     }
 
-    default <RR> IO<Product2<R, RR>> mproduct(Function<R, IO<RR>> f) {
-        return this.flatMap(r -> f.apply(r).map(rr -> Product2.apply(r, rr)));
+    default <RR> IO<Product2<R, RR>> mproduct(TFunction<R, IO<RR>> f) {
+        return this.flatMap(r -> f.applyT(r).map(rr -> Product2.apply(r, rr)));
     }
 
-    default <RR> IO<Product2<RR, R>> mproductLeft(Function<R, IO<RR>> f) {
-        return this.flatMap(r -> f.apply(r).map(rr -> Product2.apply(rr, r)));
+    default <RR> IO<Product2<RR, R>> mproductLeft(TFunction<R, IO<RR>> f) {
+        return this.flatMap(r -> f.applyT(r).map(rr -> Product2.apply(rr, r)));
     }
 
-    default <RR> IO<Product2<R, RR>> fproduct(Function<R, RR> f) {
-        return this.map(r -> Product2.apply(r, f.apply(r)));
+    default <RR> IO<Product2<R, RR>> fproduct(TFunction<R, RR> f) {
+        return this.map(r -> Product2.apply(r, f.applyT(r)));
     }
 
     default <RR> IO<Product2<RR, R>> fproductLeft(TFunction<R, RR> f) {
-        return this.map(r -> Product2.apply(f.apply(r), r));
+        return this.map(r -> Product2.apply(f.applyT(r), r));
     }
 
     default <RR> IO<RR> map(TFunction<R, RR> f) {
-        return callback -> run(attempt -> callback.accept(attempt.map(f)));
+        return new Map<>(this, f);
     }
 
-    default <RR> IO<RR> cast(Class<RR> type) {
-        return this.map(type::cast);
+    default IO<R> chainMap(Iterable<TFunction<R, R>> fs) {
+        return suspend(() -> map(stream(fs.spliterator(), false).reduce(identityT(), TFunction::andThenT)));
     }
 
     default <RR> IO<RR> flatMap(TFunction<R, IO<RR>> f) {
-        return callback -> {
+        return this.bind(f);
+    }
 
-            TConsumer<Either<Throwable, R>> g = attempt -> {
-                if (attempt.isRight()) {
-
-                    val e = attempt.map(f);
-
-                    if (e.isRight()) {
-                        (e.right()).forEach(thunk -> thunk.run(callback));
-                    } else {
-                        (e.left()).forEach(cause -> callback.accept(left(cause)));
-                    }
-                } else { // fail-fast
-                    (attempt.left()).forEach(cause -> callback.accept(left(cause)));
-                }
-            };
-
-            this.run(g);
-
-        };
+    default <RR> IO<RR> bind(TFunction<R, IO<RR>> f) {
+        return new Bind<>(this, f);
     }
 
     default <A, B> IO<B> bind(TFunction<R, IO<A>> f1, TFunction<A, IO<B>> f2) {
-        return this.flatMap(f1).flatMap(f2);
+        return this.bind(f1).bind(f2);
     }
 
     default <A, B, C> IO<C> bind(TFunction<R, IO<A>> f1, TFunction<A, IO<B>> f2, TFunction<B, IO<C>> f3) {
-        return this.flatMap(f1).flatMap(f2).flatMap(f3);
+        return this.bind(f1, f2).bind(f3);
     }
 
     default <A, B, C, D> IO<D> bind(TFunction<R, IO<A>> f1, TFunction<A, IO<B>> f2, TFunction<B, IO<C>> f3, TFunction<C, IO<D>> f4) {
-        return this.flatMap(f1).flatMap(f2).flatMap(f3).flatMap(f4);
+        return this.bind(f1, f2, f3).bind(f4);
     }
 
     default <A, B, C, D, E> IO<E> bind(TFunction<R, IO<A>> f1, TFunction<A, IO<B>> f2, TFunction<B, IO<C>> f3, TFunction<C, IO<D>> f4, TFunction<D, IO<E>> f5) {
-        return this.flatMap(f1).flatMap(f2).flatMap(f3).flatMap(f4).flatMap(f5);
-    }
-
-    default Seq<R> replicate(long n) {
-        return seq(generate(() -> this).limit(n));
+        return this.bind(f1, f2, f3, f4).bind(f5);
     }
 
     default <RR> IO<RR> as(RR value) {
@@ -356,149 +219,90 @@ public interface IO<R> extends Runnable {
         return optionT(lf).flatMap(l -> optionT(rf).map(r -> Product2.apply(l, r))).toIO();
     }
 
-    @SafeVarargs
-    static <R> Seq<R> seq(IO<R>... ops) {
-        return seq(of(ops));
+    static <R> IO<R> extractContext(TFunction<Context, R> f) {
+        return new SuspendWithContext<>(f.andThenT(Pure::new));
     }
 
-    static <R> Seq<R> seq(Stream<IO<R>> value) {
-        return new SeqImpl<>(value);
+    static <R> IO<Option<R>> findInContext(Object key, Class<R> tag) {
+        return findInContext(key);
     }
 
-    static <R> IO<TFunction<Boolean, IO<R>>> ifM(IO<R> ifTrue, IO<R> ifFalse) {
-        return pure(condition -> condition ? ifTrue : ifFalse);
+    static <R> IO<Option<R>> findInContext(Object key) {
+        return suspend(context -> pure(context.find(key)));
     }
 
-    static IO<Unit> fork() {
-        return fork(commonPool());
-    }
-
-    static IO<Unit> fork(Executor executor) {
-        return callback -> executor.execute(() -> callback.accept(right(VALUE)));
-    }
-
-    static <R> Race<R> race(IO<R> lr, IO<R> rr) {
-        return new RaceImpl<>(lr, rr);
-    }
-
-    static <A, R> TFunction<A, IO<R>> by(TFunction<A, R> f) {
-        return f.andThenT(IO::pure);
-    }
-
-    static <A, R> TFunction<IO<A>, IO<R>> lift(TFunction<A, R> f) {
-        return arg -> arg.map(f);
-    }
-
-    static <R> IO<R> delay(Callable<R> delayed) {
-        return callback -> callback.accept(delayed.attempt());
+    static <R> IO<R> delay(Callable<R> f) {
+        return new Delay<>(f);
     }
 
     static <R> IO<R> never() {
-        return callback -> {};
+        return async(callback -> {});
     }
 
     static IO<Unit> unit(Action action) {
-        return callback -> callback.accept(action.attempt());
-    }
-
-    static <R> Await<R> await(Future<R> blocker) {
-        return new AwaitImpl<>(blocker);
+        return suspend(() -> fromEither(action.attempt()));
     }
 
     static <R> IO<R> suspend(Callable<IO<R>> f) {
-        return callback -> {
-            try {
-                (f.call()).run(callback);
-            } catch (Throwable cause) {
-                callback.accept(left(cause));
-            }
-        };
+        return new Suspend<>(f);
+    }
+
+    static <R> IO<R> suspend(TFunction<Context, IO<R>> f) {
+        return new SuspendWithContext<>(f);
     }
 
     static <R> IO<R> pure(R value) {
-        return fromEither(right(value));
+        return new Pure<>(value);
     }
 
     static <R> IO<R> raise(Throwable cause) {
-        return fromEither(left(cause));
+        return raise(() -> cause);
     }
 
-    static <R> IO<R> raise(TSupplier<Throwable> cause) {
-        return callback -> {
-            try {
-                callback.accept(left(cause.get()));
-            } catch (Throwable cause2) {
-                callback.accept(left(cause2));
-            }
-        };
+    static <R> IO<R> raise(Callable<Throwable> cause) {
+        return new Raise<>(cause);
     }
 
     static <R> IO<R> fromEither(Either<Throwable, R> e) {
-        return callback -> callback.accept(e);
+        return e.fold(IO::raise, IO::pure);
     }
 
-    static <R> IO<R> async(TConsumer<AsyncCallback<R>> scope) {
-        return callback -> {
+    static <A> IO<A> async(TConsumer<AsyncCallback<A>> scope) {
+
+        TBiConsumer<IOConnection, TConsumer<Either<Throwable, A>>> f = (connected, callback) -> {
+
+            AtomicBoolean done = new AtomicBoolean(false);
+
+            val idempotent = new AsyncCallback<A>() {
+                @Override
+                public void success(A result) {
+                    if (done.compareAndSet(false, true)) {
+                        callback.accept(right(result));
+                    }
+                }
+
+                @Override
+                public void failure(Throwable cause) {
+                    if (done.compareAndSet(false, true)) {
+                        callback.accept(left(cause));
+                    }
+                }
+            };
+
             try {
-                scope.accept(wrap(callback));
+                scope.accept(idempotent);
             } catch (Throwable cause) {
                 callback.accept(left(cause));
             }
+
         };
+
+        return new Async<>(false, f);
+
     }
 
-    static Task<Unit> sleep(long delay, TimeUnit unit) {
-        return new SleepTask(delay, unit);
-    }
-
-    static <R> Task<R> timeout(long delay, TimeUnit unit) {
-        return new TimeoutTask<>(delay, unit);
-    }
-
-    static <A> Extract<A> extract(Extractable<A> e) {
-        return callback -> callback.accept(right(e));
-    }
-
-    static <A> Extract<A> extract(IO<A> fa) {
-        return fa.map(a -> ((Extractable<A>) Product.apply(a)))::run;
-    }
-
-    static <A, B> Extract2<A, B> extract(Extractable2<A, B> e) {
-        return callback -> callback.accept(right(e));
-    }
-
-    static <A, B> Extract2<A, B> extract(IO<A> fa, IO<B> fb) {
-        return fa.flatMap(a -> fb.map(b -> ((Extractable2<A, B>) Product2.apply(a, b))))::run;
-    }
-
-    static <A, B, C> Extract3<A, B, C> extract(Extractable3<A, B, C> e) {
-        return callback -> callback.accept(right(e));
-    }
-
-    static <A, B, C> Extract3<A, B, C> extract(IO<A> fa, IO<B> fb, IO<C> fc) {
-        return fa.flatMap(a -> fb.flatMap(b -> fc.map(c -> ((Extractable3<A, B, C>) Product3.apply(a, b, c)))))::run;
-    }
-
-    static <A, B, C, D> Extract4<A, B, C, D> extract(IO<A> fa, IO<B> fb, IO<C> fc, IO<D> fd) {
-        return fa.flatMap(a -> fb.flatMap(b -> fc.flatMap(c -> fd.map(d -> ((Extractable4<A, B, C, D>) Product4.apply(a, b, c, d))))))::run;
-    }
-
-    static <A, B, C, D> Extract4<A, B, C, D> extract(Extractable4<A, B, C, D> e) {
-        return callback -> callback.accept(right(e));
-    }
-
-    static <A, B, C, D, E> Extract5<A, B, C, D, E> extract(Extractable5<A, B, C, D, E> e) {
-        return callback -> callback.accept(right(e));
-    }
-
-    static <A, B, C, D, E> Extract5<A, B, C, D, E> extract(IO<A> fa, IO<B> fb, IO<C> fc, IO<D> fd, IO<E> fe) {
-        return fa.flatMap(a -> fb.flatMap(b -> fc.flatMap(c -> fd.flatMap(d -> fe.map(e -> ((Extractable5<A, B, C, D, E>) Product5.apply(a, b, c, d, e)))))))::run;
-    }
-
-    static <R> IO<R> loop(IO<R> fr) {
-        return callback -> {
-            while (!interrupted()) fr.run(callback);
-        };
+    static <R> IO<Unit> loop(IO<R> body) {
+        return U.forever(constantT(body.productR(U)));
     }
 
     private static <R> TConsumer<Either<Throwable, R>> printStackTrace(PrintStream errors) {
@@ -509,6 +313,409 @@ public interface IO<R> extends Runnable {
         return attempt -> {
             if (attempt.isRight()) successor.countDown();
         };
+    }
+
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    static <R> void runLoop( IO<R> source
+                           , TFunction bindFirst
+                           , IOConnection connected
+                           , RestartCallback<R> restart
+                           , TConsumer<Either<Throwable, R>> callback
+                           , ArrayStack<TFunction<Object, IO<Object>>> bindRest ) {
+        //
+        Context currentContext = empty;
+        //
+        R value = (null);
+        //
+        RestartCallback restartCallback = restart;
+        //
+        while (true) {
+            //
+            if (source instanceof ContextBind) {
+                //
+                currentContext = ((ContextBind) source).localContext.merge(currentContext);
+                //
+                source = ((ContextBind) source).source;
+                //
+            } else if (source instanceof SuspendWithContext) try {
+                //
+                source = (IO) ((SuspendWithContext) source).f.applyT(currentContext);
+                //
+            } catch (Throwable cause) {
+                //
+                source = raise(cause);
+                //
+            } else if (source instanceof Bind) {
+                //
+                if (nonNull(bindFirst)) {
+                    //
+                    if (isNull(bindRest)) bindRest = new ArrayStack<>();
+                    //
+                    bindRest.push(bindFirst);
+                    //
+                }
+                //
+                bindFirst = ((Bind) source).f;
+                //
+                source = ((Bind) source).source;
+                //
+            } else if (source instanceof Pure) {
+                //
+                value = (R) ((Pure) source).value;
+                //
+                source = (null);
+                //
+            } else if (source instanceof Delay) try {
+                //
+                value = (R) ((Delay) source).f.call();
+                //
+                source = (null);
+                //
+            } catch (Throwable cause) {
+                //
+                source = raise(cause);
+                //
+            } else if (source instanceof Suspend) try {
+                //
+                source = (IO) ((Suspend) source).f.call();
+                //
+            } catch (Throwable cause) {
+                //
+                source = raise(cause);
+                //
+            } else if (source instanceof Raise) {
+                //
+                val h = findHandler(bindFirst, bindRest);
+                //
+                if (isNull(h)) {
+                    //
+                    callback.accept(left(((Throwable) merge(((Raise) source).cause.attempt()))));
+                    //
+                    return;
+                    //
+                } else try {
+                    //
+                    source = (IO<R>) h.recover(((Throwable) merge(((Raise) source).cause.attempt())));
+                    //
+                } catch (Throwable cause) {
+                    //
+                    source = raise(cause);
+                    //
+                } finally {
+                    //
+                    bindFirst = (null);
+                    //
+                }
+            } else if (source instanceof Async) {
+                //
+                if (isNull(connected)) connected = connect(true);
+                //
+                if (isNull(restart)) restart = new RestartCallback<>(callback).switchContext(connected);
+                //
+                restart.start((Async) source, bindFirst, bindRest);
+                //
+                return; // done
+                //
+            } else if (source instanceof ContextSwitch) {
+                //
+                val modify = ((ContextSwitch) source).modify;
+                //
+                val next = ((ContextSwitch) source).source;
+                //
+                val restore = ((ContextSwitch) source).restore;
+                //
+                val connect = nonNull(connected) ? connected : connect(true);
+                //
+                connected = (IOConnection) modify.apply(connect);
+                //
+                source = next;
+                //
+                if (connected != connect) {
+                    //
+                    if (nonNull(restartCallback)) {
+                        //
+                        restartCallback.switchContext(connected);
+                        //
+                    }
+                    //
+                    if (nonNull(restore)) {
+                        //
+                        source = new Bind(next, new RestoreContext(connect, restore));
+                        //
+                    }
+                }
+                //
+            } else if (source instanceof Map) {
+                //
+                if (nonNull(bindFirst)) {
+                    //
+                    if (isNull(bindRest)) bindRest = new ArrayStack<>();
+                    //
+                    bindRest.push(bindFirst);
+                    //
+                }
+                //
+                bindFirst = (Map) source;
+                //
+                source = ((Map) source).source;
+                //
+            } else {
+                throw new RuntimeException("Unknown IO constructor");
+            }
+            //
+            if (nonNull(value)) {
+                //
+                var bind = popNextBind(bindFirst, bindRest);
+                //
+                if (nonNull(bind)) try {
+                    //
+                    source = (IO<R>) bind.apply(value);
+                    //
+                } catch (Throwable cause) {
+                    //
+                    source = raise(cause);
+                    //
+                } finally {
+                    //
+                    value     = (null);
+                    //
+                    bindFirst = (null);
+                    //
+                } else {
+                    //
+                    callback.accept(right(value));
+                    //
+                    return; // done
+                    //
+                }
+            }
+        }
+    }
+
+    static TFunction<Object, IO<Object>> popNextBind( TFunction<Object, IO<Object>> bindFirst
+                                                    , ArrayStack<TFunction<Object, IO<Object>>> bindRest ) {
+
+        if (nonNull(bindFirst) && !(bindFirst instanceof ErrorHandler)) return bindFirst;
+
+        if (isNull(bindRest)) return (null);
+
+        var bindNext = bindRest.pop();
+
+        while (true) if (isNull(bindNext)) {
+            return (null);
+        } else if (!(bindNext instanceof ErrorHandler)) {
+            return (bindNext);
+        }
+    }
+
+    static IOFrame<Object, IO<Object>> findHandler( TFunction<Object, IO<Object>> bind
+                                                  , ArrayStack<TFunction<Object, IO<Object>>> binds ) {
+
+        if (bind instanceof IOFrame) {
+            return (IOFrame<Object, IO<Object>>) bind;
+        } else if (isNull(binds)) {
+            return (null);
+        } else while (true) {
+
+            val pop = binds.pop();
+
+            if (isNull(pop)) {
+                return (null);
+            } else if (pop instanceof IOFrame) {
+                return (IOFrame<Object, IO<Object>>) pop;
+            }
+        }
+    }
+
+    abstract class IOFrame<A, R> implements TFunction<A, R> {
+
+        abstract R recover(Throwable e);
+
+        final R fold(Either<Throwable, A> e) {
+            return e.fold(this::recover, this);
+        }
+
+    }
+
+    @Value
+    class Bind<A, B> implements IO<B> {
+        IO<A> source;
+        TFunction<A, IO<B>> f;
+    }
+
+    @Value
+    class Map<A, B> implements IO<B>, TFunction<A, IO<B>> {
+
+        IO<A> source;
+        TFunction<A, B> f;
+
+        @Override
+        public IO<B> applyT(A arg) throws Throwable {
+            return f.andThenT(Pure::new).applyT(arg);
+        }
+    }
+
+    @Value
+    class Suspend<A> implements IO<A> {
+        Callable<IO<A>> f;
+    }
+
+    @Value
+    class SuspendWithContext<A> implements IO<A> {
+        TFunction<Context, IO<A>> f;
+    }
+
+    @Value
+    class Raise<A> implements IO<A> {
+        Callable<Throwable> cause;
+    }
+
+    @Value
+    class Delay<A> implements IO<A> {
+        Callable<A> f;
+    }
+
+    @Value
+    class Pure<A> implements IO<A> {
+        A value;
+    }
+
+    @Value
+    class Async<A> implements IO<A> {
+        boolean trampolineAfter;
+        TBiConsumer<IOConnection, TConsumer<Either<Throwable, A>>> callback;
+    }
+
+    @Value
+    class ContextBind<A> implements IO<A> {
+
+        IO<A> source;
+        Context localContext;
+
+        @Override
+        public IO<A> enrich(Context context) {
+            return new ContextBind<>(source, localContext.merge(context));
+        }
+
+    }
+
+    @Value
+    class ContextSwitch<A> implements IO<A> {
+        IO<A> source;
+        TFunction<IOConnection, IOConnection> modify;
+        TFunction4<A, Throwable, IOConnection, IOConnection, IOConnection> restore;
+    }
+
+}
+
+@RequiredArgsConstructor
+final class RestartCallback<A> implements TConsumer<Either<Throwable, A>>, Runnable {
+
+    private final TConsumer<Either<Throwable, A>> callback;
+
+    private IOConnection connection;
+
+    private boolean callable        = false;
+    private boolean trampolineAfter = false;
+
+    private TFunction<Object, IO<Object>> bindFirst = null;
+
+    private ArrayStack<TFunction<Object, IO<Object>>> bindRest = null;
+
+    private Either<Throwable, A> value = null;
+
+    RestartCallback<A> switchContext(IOConnection connection) {
+        this.connection = connection;
+        return this;
+    }
+
+    void start( Async<A> task
+              , TFunction<Object, IO<Object>> bindFirst
+              , ArrayStack<TFunction<Object, IO<Object>>> bindRest ) {
+        //
+        this.callable = true;
+        //
+        this.bindRest  = bindRest;
+        this.bindFirst = bindFirst;
+        //
+        this.trampolineAfter = task.isTrampolineAfter();
+        //
+        (task.getCallback()).accept(connection, this);
+    }
+
+    private void signal(Either<Throwable, A> e) {
+        // Auto-cancelable logic: in case the connection was cancelled,
+        // we interrupt the bind continuation
+        if (!connection.isCanceled()) {
+            runLoop(fromEither(e), bindFirst, connection, this, callback, bindRest);
+        }
+    }
+
+    @Override
+    public void run() {
+        // N.B. this has to be set to null *before* the signal
+        // otherwise a race condition can happen ;-)
+        var localValue = value;
+        //
+        this.value = (null);
+        //
+        this.signal(localValue);
+    }
+
+    @Override
+    public void acceptT(Either<Throwable, A> e) {
+        if (callable) {
+            //
+            this.callable = false;
+            //
+            if (trampolineAfter) {
+                //
+                this.value = e;
+                //
+                this.run();
+                //
+            } else {
+                this.signal(e);
+            }
+        }
+    }
+}
+
+@RequiredArgsConstructor
+final class RestoreContext<R> extends IOFrame<R, IO<R>> {
+
+    private final IOConnection connected;
+    private final TFunction4<R, Throwable, IOConnection, IOConnection, IOConnection> restore;
+
+    @Override
+    public IO<R> applyT(R result) {
+        return new ContextSwitch<>(pure(result), current -> restore.apply(result, (null), connected, current), (null));
+    }
+
+    @Override
+    public IO<R> recover(Throwable cause) {
+        return new ContextSwitch<>(raise(cause), current -> restore.apply((null), cause, connected, current), (null));
+    }
+
+}
+
+@SuppressWarnings({"rawtypes", "unchecked"})
+final class Attempt<A> extends IOFrame<A, IO<Either<Throwable, A>>> {
+
+    private static final Attempt instance = new Attempt();
+
+    @Override
+    public IO<Either<Throwable, A>> applyT(A value) {
+        return pure(right(value));
+    }
+
+    @Override
+    public IO<Either<Throwable, A>> recover(Throwable cause) {
+        return pure(left(cause));
+    }
+
+    static <R> Attempt<R> getAttemptInstance() {
+        return instance;
     }
 
 }

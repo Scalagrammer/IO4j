@@ -1,28 +1,36 @@
 package scg.io4j;
 
-import io.atlassian.fugue.Either;
 import io.atlassian.fugue.Unit;
 import lombok.RequiredArgsConstructor;
 import scg.io4j.utils.NamingThreadFactory;
+import scg.io4j.utils.TConsumer;
 import scg.io4j.utils.TSupplier;
 
-import java.util.concurrent.*;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 
-import static io.atlassian.fugue.Either.left;
-import static io.atlassian.fugue.Either.right;
-import static java.util.concurrent.Executors.*;
 import static io.atlassian.fugue.Unit.VALUE;
+import static java.util.concurrent.Executors.newScheduledThreadPool;
+import static java.util.concurrent.Executors.newSingleThreadScheduledExecutor;
+import static scg.io4j.IO.async;
 import static scg.io4j.IO.unit;
+import static scg.io4j.utils.TSupplier.ofInstanceT;
 
 public interface Scheduler extends Executor {
 
     IO<Unit> shutdown();
 
+    IO<Unit> fork();
+
     IO<Unit> schedule(long delay, TimeUnit unit);
 
-    <R> IO<R> timeout(long delay, TimeUnit unit, Throwable cause);
-
     <R> IO<R> timeout(long delay, TimeUnit unit, TSupplier<Throwable> cause);
+
+    default  <R> IO<R> timeout(long delay, TimeUnit unit, Throwable cause) {
+        return this.timeout(delay, unit, ofInstanceT(cause));
+    }
 
     default <R> IO<R> timeout(long delay, TimeUnit unit) {
         return this.timeout(delay, unit, TimeoutException.instance);
@@ -61,35 +69,48 @@ public interface Scheduler extends Executor {
 @RequiredArgsConstructor
 final class SchedulerImpl implements Scheduler {
 
-    private static final Either<Throwable, Unit> rightUnit = right(VALUE);
-
     private final ScheduledExecutorService executor;
 
     @Override
     public IO<Unit> schedule(long delay, TimeUnit unit) {
-        return callback -> executor.schedule(() -> callback.accept(rightUnit), delay, unit);
+        ////////////////////////////////////////////////////
+        TConsumer<AsyncCallback<Unit>> scope = callback -> {
+            this.executor.schedule(() -> callback.success(VALUE), delay, unit);
+        };
+        ////////////////////
+        return async(scope);
+        //
     }
 
     @Override
-    public <R> IO<R> timeout(long delay, TimeUnit unit, Throwable cause) {
-        return callback -> executor.schedule(() -> callback.accept(left(cause)), delay, unit);
-    }
-
-    @Override
-    public <R> IO<R> timeout(long delay, TimeUnit unit, TSupplier<Throwable> cause) {
-        return callback -> {
-
+    public <R> IO<R> timeout(long delay, TimeUnit unit, TSupplier<Throwable> supply) {
+        /////////////////////////////////////////////////
+        TConsumer<AsyncCallback<R>> scope = callback -> {
+            //////////////////////////
             Runnable command = () -> {
                 try {
-                    callback.accept(left(cause.get()));
-                } catch (Throwable cause2) {
-                    callback.accept(left(cause2));
+                    callback.failure(supply.getT());
+                } catch (Throwable cause) {
+                    callback.failure(cause);
                 }
             };
-
+            /////////////////////////////////////////////
             this.executor.schedule(command, delay, unit);
-
+            //
         };
+        ////////////////////
+        return async(scope);
+        //
+    }
+
+    @Override
+    public IO<Unit> fork() {
+        ////////////////////////////////////////////////////
+        TConsumer<AsyncCallback<Unit>> scope = callback -> {
+            this.executor.execute(() -> callback.success(VALUE));
+        };
+        ////////////////////
+        return async(scope);
     }
 
     @Override

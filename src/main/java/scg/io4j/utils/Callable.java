@@ -6,7 +6,7 @@ import static io.atlassian.fugue.Either.right;
 import io.atlassian.fugue.Either;
 
 @FunctionalInterface
-public interface Callable<R> extends Attempt<R> {
+public interface Callable<R> extends AttemptCapable<R> {
 
     R call() throws Throwable;
 

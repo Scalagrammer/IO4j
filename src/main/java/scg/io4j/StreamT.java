@@ -105,9 +105,9 @@ public class StreamT<R> {
         return this.value.flatMap(s -> unit(() -> s.forEach(action)));
     }
 
-    public <A> IO<Map<A, List<R>>> groupBy(TFunction<R, A> classifier) {
-        return this.collect(groupingBy(classifier));
-    }
+//    public <A> IO<Map<A, List<R>>> groupBy(TFunction<R, A> classifier) {
+//        return this.collect(groupingBy(classifier));
+//    }
 
     public <A, RR> IO<RR> collect(Collector<R, A, RR> collector) {
         return this.value.map(s -> s.collect(collector));

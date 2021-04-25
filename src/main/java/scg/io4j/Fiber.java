@@ -11,21 +11,14 @@ public interface Fiber<R> {
 
     IO<R> join();
 
-    default IO<R> joinOn(Executor executor) {
-        return fork(executor).productR(join());
-    }
+//    default IO<R> joinOn(Executor executor) {
+//        return fork(executor).productR(join());
+//    }
 
-    IO<Unit> cancel(boolean mayInterruptIfRunning);
+    IO<Unit> cancel();
 
-    default IO<Unit> cancel() {
-        return this.cancel(false);
-    }
+    static <R> Fiber<R> wrap(CompletableFuture<R> f, IOConnection connected) {
 
-    static IO<Unit> interrupt(Fiber<?> f) {
-        return f.cancel(true);
-    }
-
-    static <R> Fiber<R> wrap(CompletableFuture<R> f) {
         return new Fiber<>() {
             @Override
             public IO<R> join() {
@@ -33,8 +26,8 @@ public interface Fiber<R> {
             }
 
             @Override
-            public IO<Unit> cancel(boolean mayInterruptIfRunning) {
-                return unit(() -> f.cancel(mayInterruptIfRunning));
+            public IO<Unit> cancel() {
+                return connected.cancel();
             }
         };
     }
