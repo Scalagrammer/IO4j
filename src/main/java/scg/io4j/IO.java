@@ -15,8 +15,6 @@ import scg.io4j.IO.ContextSwitch;
 
 import java.io.PrintStream;
 
-import java.util.NoSuchElementException;
-import java.util.Objects;
 import java.util.concurrent.Executor;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CompletableFuture;
@@ -37,7 +35,6 @@ import static scg.io4j.Context.empty;
 import static scg.io4j.Context.fromMap;
 
 import static scg.io4j.IO.*;
-import static scg.io4j.OptionT.optionT;
 import static scg.io4j.IOConnection.connect;
 import static scg.io4j.utils.Callable.always;
 import static scg.io4j.utils.TFunction.constantT;
@@ -117,9 +114,7 @@ public interface IO<R> extends Runnable {
 
     default IO<Fiber<R>> start(boolean interruptible, Scheduler scheduler) {
         //
-        TConsumer<AsyncCallback<Fiber<R>>> scope = callback -> {
-            //
-            val cancelable = connect(true);
+        TBiConsumer<IOConnection, TConsumer<Either<Throwable, Fiber<R>>>> f = (connected, callback) -> {
             //
             val promise = new CompletableFuture<R>();
             //
@@ -127,12 +122,12 @@ public interface IO<R> extends Runnable {
                 attempt.fold(promise::completeExceptionally, promise::complete);
             };
             //
-            runLoop(scheduler.fork(interruptible, this), (null), (cancelable), (null), (complete), (null));
+            runLoop(scheduler.fork(interruptible, this), (null), (connected), (null), (complete), (null));
             //
-            callback.success(wrap(promise, cancelable));
+            callback.accept(right(wrap(promise, connected)));
         };
         //
-        return async(scope);
+        return new Async<>(false, f);
     }
 
     default IO<R> shift(Scheduler scheduler) {
@@ -242,10 +237,6 @@ public interface IO<R> extends Runnable {
 
     // constructor
 
-    static <L, R> IO<Option<Product2<L, R>>> tupled(IO<Option<L>> fl, IO<Option<R>> fr) {
-        return optionT(fl).flatMap(valueL -> optionT(fr).map(valueR -> Product2.apply(valueL, valueR))).toIO();
-    }
-
     static <R> IO<R> extractContext(TFunction<Context, R> f) {
         return new SuspendWithContext<>(f.andThenT(Pure::new));
     }
@@ -336,6 +327,42 @@ public interface IO<R> extends Runnable {
         };
     }
 
+    static <A, B> Tupled2<A, B> tupled(IO<A> fa, IO<B> fb) {
+        return new Tupled2<>() {
+            @Override
+            public <R> IO<R> bind(TFunction2<A, B, IO<R>> f) {
+                return fa.bind(a -> fb.bind(b -> f.applyT(a, b)));
+            }
+        };
+    }
+
+    static <A, B, C> Tupled3<A, B, C> tupled(IO<A> fa, IO<B> fb, IO<C> fc) {
+        return new Tupled3<>() {
+            @Override
+            public <R> IO<R> bind(TFunction3<A, B, C, IO<R>> f) {
+                return fa.bind(a -> fb.bind(b -> fc.bind(c -> f.applyT(a, b, c))));
+            }
+        };
+    }
+
+    static <A, B, C, D> Tupled4<A, B, C, D> tupled(IO<A> fa, IO<B> fb, IO<C> fc, IO<D> fd) {
+        return new Tupled4<>() {
+            @Override
+            public <R> IO<R> bind(TFunction4<A, B, C, D, IO<R>> f) {
+                return fa.bind(a -> fb.bind(b -> fc.bind(c -> fd.bind(d -> f.applyT(a, b, c, d)))));
+            }
+        };
+    }
+
+    static <A, B, C, D, E> Tupled5<A, B, C, D, E> tupled(IO<A> fa, IO<B> fb, IO<C> fc, IO<D> fd, IO<E> fe) {
+        return new Tupled5<>() {
+            @Override
+            public <R> IO<R> bind(TFunction5<A, B, C, D, E, IO<R>> f) {
+                return fa.bind(a -> fb.bind(b -> fc.bind(c -> fd.bind(d -> fe.bind(e -> f.applyT(a, b, c, d, e))))));
+            }
+        };
+    }
+
     @SuppressWarnings({"rawtypes", "unchecked"})
     static <R> void runLoop( IO<R> source
                            , TFunction bindFirst
@@ -385,7 +412,9 @@ public interface IO<R> extends Runnable {
                 value = (R) ((Pure) source).value;
                 //
                 if (isNull(value)) {
+                    //
                     throw new NullPointerException("pure(null)");
+                    //
                 }
                 //
                 source = (null);
@@ -395,7 +424,9 @@ public interface IO<R> extends Runnable {
                 value = (R) ((Delay) source).f.call();
                 //
                 if (isNull(value)) {
+                    //
                     throw new NullPointerException("delay(() -> null)");
+                    //
                 }
                 //
                 source = (null);
@@ -440,9 +471,9 @@ public interface IO<R> extends Runnable {
                 //
                 if (isNull(connected)) connected = connect(true);
                 //
-                if (isNull(restart)) restart = new RestartCallback<>(callback).switchContext(connected);
+                if (isNull(restart)) restart = new RestartCallback<>(callback);
                 //
-                restart.start((Async) source, bindFirst, bindRest);
+                restart.switchContext(connected).start((Async) source, bindFirst, bindRest);
                 //
                 return; // done
                 //
@@ -521,6 +552,7 @@ public interface IO<R> extends Runnable {
                     return; // done
                 }
             }
+            //
         }
     }
 
@@ -641,6 +673,45 @@ public interface IO<R> extends Runnable {
 }
 
 @RequiredArgsConstructor
+final class RestoreContext<R> extends IOFrame<R, IO<R>> {
+
+    private final IOConnection connected;
+    private final TFunction4<R, Throwable, IOConnection, IOConnection, IOConnection> restore;
+
+    @Override
+    public IO<R> applyT(R result) {
+        return new ContextSwitch<>(pure(result), current -> restore.apply(result, (null), connected, current), (null));
+    }
+
+    @Override
+    public IO<R> recover(Throwable cause) {
+        return new ContextSwitch<>(raise(cause), current -> restore.apply((null), cause, connected, current), (null));
+    }
+
+}
+
+@SuppressWarnings({"rawtypes", "unchecked"})
+final class Attempt<A> extends IOFrame<A, IO<Either<Throwable, A>>> {
+
+    private static final Attempt instance = new Attempt();
+
+    @Override
+    public IO<Either<Throwable, A>> applyT(A value) {
+        return pure(right(value));
+    }
+
+    @Override
+    public IO<Either<Throwable, A>> recover(Throwable cause) {
+        return pure(left(cause));
+    }
+
+    static <R> Attempt<R> getAttemptInstance() {
+        return instance;
+    }
+
+}
+
+@RequiredArgsConstructor
 final class RestartCallback<A> implements TConsumer<Either<Throwable, A>>, Runnable {
 
     private final TConsumer<Either<Throwable, A>> callback;
@@ -709,45 +780,6 @@ final class RestartCallback<A> implements TConsumer<Either<Throwable, A>>, Runna
         if (!connection.isCanceled()) {
             runLoop(fromEither(attempt), (bindFirst), (connection), this, (callback), (bindRest));
         }
-    }
-
-}
-
-@RequiredArgsConstructor
-final class RestoreContext<R> extends IOFrame<R, IO<R>> {
-
-    private final IOConnection connected;
-    private final TFunction4<R, Throwable, IOConnection, IOConnection, IOConnection> restore;
-
-    @Override
-    public IO<R> applyT(R result) {
-        return new ContextSwitch<>(pure(result), current -> restore.apply(result, (null), connected, current), (null));
-    }
-
-    @Override
-    public IO<R> recover(Throwable cause) {
-        return new ContextSwitch<>(raise(cause), current -> restore.apply((null), cause, connected, current), (null));
-    }
-
-}
-
-@SuppressWarnings({"rawtypes", "unchecked"})
-final class Attempt<A> extends IOFrame<A, IO<Either<Throwable, A>>> {
-
-    private static final Attempt instance = new Attempt();
-
-    @Override
-    public IO<Either<Throwable, A>> applyT(A value) {
-        return pure(right(value));
-    }
-
-    @Override
-    public IO<Either<Throwable, A>> recover(Throwable cause) {
-        return pure(left(cause));
-    }
-
-    static <R> Attempt<R> getAttemptInstance() {
-        return instance;
     }
 
 }

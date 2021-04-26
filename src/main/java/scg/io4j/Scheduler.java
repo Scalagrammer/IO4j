@@ -60,6 +60,10 @@ public interface Scheduler extends Executor {
         return wrap(newSingleThreadScheduledExecutor(factory(name, false)));
     }
 
+    static Scheduler single() {
+        return single("single-io-%d");
+    }
+
     static Scheduler two(String name) {
         return fixed(name, 2);
     }
@@ -112,7 +116,6 @@ final class SchedulerImpl implements Scheduler {
         };
         ////////////////////
         return async(scope);
-        //
     }
 
     @Override
